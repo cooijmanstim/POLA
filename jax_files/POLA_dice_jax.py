@@ -25,10 +25,9 @@ from flax.training.train_state import TrainState
 
 from flax.training import checkpoints
 
-from tensorflow_probability.substrates import jax as tfp
-
-tfd = tfp.distributions
-
+# tensorflow probability === tf/jax/cuda version hell
+#from tensorflow_probability.substrates import jax as tfp
+#tfd = tfp.distributions
 
 from coin_game_jax import CoinGame
 from ipd_jax import IPD
@@ -187,12 +186,12 @@ def act(stuff, unused ):
         h_v, values = None, None
         ret_vals = None
 
-    dist = tfd.Categorical(logits=logits)
     key, subkey = jax.random.split(key)
-    actions = dist.sample(seed=subkey)
-
-    log_probs_actions = dist.log_prob(actions)
-
+    actions = jax.random.categorical(subkey, logits)
+    log_probs_actions = jax.vmap(lambda z, a: z[a])(nn.log_softmax(logits), actions)
+    #dist = tfd.Categorical(logits=logits)
+    #actions = dist.sample(seed=subkey)
+    #log_probs_actions = dist.log_prob(actions)
 
     stuff = (key, env_batch_states, th_p_trainstate, th_p_trainstate_params, th_v_trainstate, th_v_trainstate_params, h_p, h_v)
     aux = (actions, log_probs_actions, ret_vals, h_p, h_v, categorical_act_probs, logits)
