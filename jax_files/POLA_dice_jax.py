@@ -1250,7 +1250,7 @@ def eval_progress(subkey, ts_th1, ts_val1, ts_th2, ts_val2):
     else:
         return avg_rew1, avg_rew2, None, None, None, None, score1rec, score2rec
 
-def get_init_tss(key, action_size, input_size):
+def get_init_trainstates(key, action_size, input_size):
     hidden_size = args.hidden_size
 
     key, key_p1, key_v1, key_p2, key_v2 = jax.random.split(key, 5)
@@ -1308,179 +1308,8 @@ def get_val_loss_for_om(key, om_ts_th, om_ts_th_params, om_ts_val, om_ts_val_par
     val_loss = value_loss(rewards, curr_vals, end_state_v)
     return val_loss
 
-@jit
-def opp_model_selfagent1_single_batch(inputstuff, unused ):
-    key, ts_th1, ts_val1, true_other_ts_th, true_other_ts_val, om_ts_th, om_ts_val = inputstuff
-    key, subkey = jax.random.split(key)
-
-    stuff, aux, unfinished_state_history = do_env_rollout(subkey,
-                                                          ts_th1, ts_th1.params, ts_val1, ts_val1.params,
-                                                          true_other_ts_th, true_other_ts_th.params,
-                                                          true_other_ts_val, true_other_ts_val.params,
-                                                          agent_for_state_history=2)
-
-    key, env_state, obs1, obs2, \
-    _, _, _, _, \
-    _, _, _, _, \
-    h_p1, h_v1, h_p2, h_v2 = stuff
-
-    aux1, aux2, aux_info = aux
-
-    cat_act_probs2_list, obs2_list, lp2_list, lp1_list, v2_list, r2_list, a2_list, a1_list = aux2
-
-    unfinished_state_history.extend(obs2_list)
-    other_state_history = unfinished_state_history
-
-    other_act_history = a2_list
-    other_rew_history = r2_list
-
-    # I can do multiple "batches"
-    # where repeating the below would be the same as collecting one big batch of environment interaction
-
-    other_act_history = jax.nn.one_hot(other_act_history, action_size)
-
-    om_grad_fn = jax.grad(get_c_e_for_om, argnums=2)
-    if use_baseline:
-        om_val_grad_fn = jax.grad(get_val_loss_for_om, argnums=4)
-
-    for opp_model_iter in range(args.opp_model_steps_per_batch):
-
-        key, subkey = jax.random.split(key)
-        grad_th = om_grad_fn(subkey,
-                             om_ts_th, om_ts_th.params, om_ts_val, om_ts_val.params,
-                             other_state_history, other_act_history)
-
-        om_ts_th = om_ts_th.apply_gradients(grads=grad_th)
-
-        if use_baseline:
-            # act just to get the final state values
-            key, subkey = jax.random.split(key)
-            act_args2 = (subkey, obs2, om_ts_th, om_ts_th.params, om_ts_val, om_ts_val.params, h_p2, h_v2)
-            stuff2, aux2 = act(act_args2, None)
-            a2, lp2, v2, h_p2, h_v2, cat_act_probs2, logits2 = aux2
-
-            end_state_v = v2
-            grad_v = om_val_grad_fn(subkey,
-                                    om_ts_th, om_ts_th.params, om_ts_val, om_ts_val.params,
-                                    other_state_history, other_act_history,
-                                    other_rew_history, end_state_v)
-            om_ts_val = om_ts_val.apply_gradients(grads=grad_v)
-
-    inputstuff = (key, ts_th1, ts_val1, true_other_ts_th, true_other_ts_val, om_ts_th, om_ts_val)
-    aux = None
-    return inputstuff, aux
-
-@jit
-def opp_model_selfagent2_single_batch(inputstuff, unused ):
-    key, true_other_ts_th, true_other_ts_val, ts_th2, ts_val2, om_ts_th, om_ts_val = inputstuff
-
-    key, subkey = jax.random.split(key)
-
-    stuff, aux, unfinished_state_history = do_env_rollout(subkey,
-                                                          true_other_ts_th, true_other_ts_th.params, true_other_ts_val, true_other_ts_val.params,
-                                                          ts_th2, ts_th2.params, ts_val2, ts_val2.params,
-                                                          agent_for_state_history=1)
-
-    key, env_state, obs1, obs2, \
-    _, _, _, _, \
-    _, _, _, _, \
-    h_p1, h_v1, h_p2, h_v2 = stuff
-
-    aux1, aux2, aux_info = aux
-
-    cat_act_probs1_list, obs1_list, lp1_list, lp2_list, v1_list, r1_list, a1_list, a2_list = aux1
-
-    unfinished_state_history.extend(obs1_list)
-    other_state_history = unfinished_state_history
-
-    other_act_history = a1_list
-    other_rew_history = r1_list
-
-    # I can do multiple "batches"
-    # where repeating the below would be the same as collecting one big batch of environment interaction
-
-    other_act_history = jax.nn.one_hot(other_act_history, action_size)
-
-    om_grad_fn = jax.grad(get_c_e_for_om, argnums=2)
-    if use_baseline:
-        om_val_grad_fn = jax.grad(get_val_loss_for_om, argnums=4)
-
-    for opp_model_iter in range(args.opp_model_steps_per_batch):
-
-        key, subkey = jax.random.split(key)
-        grad_th = om_grad_fn(subkey, om_ts_th, om_ts_th.params,
-                             om_ts_val, om_ts_val.params,
-                             other_state_history, other_act_history)
-
-        om_ts_th = om_ts_th.apply_gradients(grads=grad_th)
-
-        if use_baseline:
-            # act just to get the final state values
-            key, subkey = jax.random.split(key)
-            act_args1 = (subkey, obs1, om_ts_th, om_ts_th.params, om_ts_val, om_ts_val.params, h_p1, h_v1)
-            stuff1, aux1 = act(act_args1, None)
-            a1, lp1, v1, h_p1, h_v1, cat_act_probs1, logits1 = aux1
-
-            end_state_v = v1
-            grad_v = om_val_grad_fn(subkey,
-                                    om_ts_th, om_ts_th.params, om_ts_val, om_ts_val.params,
-                                    other_state_history, other_act_history,
-                                    other_rew_history, end_state_v)
-            om_ts_val = om_ts_val.apply_gradients(grads=grad_v)
-
-    inputstuff = (key, true_other_ts_th, true_other_ts_val, ts_th2, ts_val2, om_ts_th, om_ts_val)
-    aux = None
-    return inputstuff, aux
-
-
-
-@jit
-def opp_model_selfagent1(key, ts_th1, ts_val1, true_other_ts_th, true_other_ts_val,
-              prev_om_ts_th, prev_om_ts_val):
-    # true_other_theta_p and true_other_theta_v used only in the collection of data (rollouts in the environment)
-    # so then this is not cheating. We do not assume access to other agent policy parameters (at least not direct, white box access)
-    # We assume ability to collect trajectories through rollouts/play with the other agent in the environment
-    # Essentially when using OM, we are now no longer doing dice update on the trajectories collected directly (which requires parameter access)
-    # instead we collect the trajectories first, then build an OM, then rollout using OM and make DiCE/LOLA/POLA update based on that OM
-    # Instead of direct rollout using opponent true parameters and update based on that.
-
-    # Here have prev_om trainstates be the get_init_tss on the first iter before the first opp model
-    om_ts_th = TrainState.create(apply_fn=prev_om_ts_th.apply_fn, params=prev_om_ts_th.params, tx=prev_om_ts_th.tx)
-    om_ts_val = TrainState.create(apply_fn=prev_om_ts_val.apply_fn, params=prev_om_ts_val.params, tx=prev_om_ts_val.tx)
-    key, subkey = jax.random.split(key)
-    stuff = (subkey, ts_th1, ts_val1, true_other_ts_th, true_other_ts_val, om_ts_th, om_ts_val)
-    stuff, aux = jax.lax.scan(opp_model_selfagent1_single_batch, stuff, None, args.opp_model_data_batches)
-    _, ts_th1, ts_val1, true_other_ts_th, true_other_ts_val, om_ts_th, om_ts_val = stuff
-
-    return om_ts_th, om_ts_val
-
-
-
-@jit
-def opp_model_selfagent2(key, true_other_ts_th, true_other_ts_val, ts_th2, ts_val2,
-              prev_om_ts_th, prev_om_ts_val):
-    # true_other_theta_p and true_other_theta_v used only in the collection of data (rollouts in the environment)
-    # so then this is not cheating. We do not assume access to other agent policy parameters (at least not direct, white box access)
-    # We assume ability to collect trajectories through rollouts/play with the other agent in the environment
-    # Essentially when using OM, we are now no longer doing dice update on the trajectories collected directly (which requires parameter access)
-    # instead we collect the trajectories first, then build an OM, then rollout using OM and make DiCE/LOLA/POLA update based on that OM
-    # Instead of direct rollout using opponent true parameters and update based on that.
-
-    # Here have prev_om trainstates be the get_init_tss on the first iter before the first opp model
-    om_ts_th = TrainState.create(apply_fn=prev_om_ts_th.apply_fn, params=prev_om_ts_th.params, tx=prev_om_ts_th.tx)
-    om_ts_val = TrainState.create(apply_fn=prev_om_ts_val.apply_fn, params=prev_om_ts_val.params, tx=prev_om_ts_val.tx)
-    key, subkey = jax.random.split(key)
-    stuff = (subkey, true_other_ts_th, true_other_ts_val, ts_th2, ts_val2, om_ts_th, om_ts_val)
-    stuff, aux = jax.lax.scan(opp_model_selfagent2_single_batch, stuff, None, args.opp_model_data_batches)
-    _, _, _, _, _, om_ts_th, om_ts_val = stuff
-
-    return om_ts_th, om_ts_val
-
-
 # redefine play, simplified so we can actually see what's happening (cooijmat)
-def play(key, init_ts_th1, init_ts_val1, init_ts_th2, init_ts_val2, use_opp_model=False):
-    assert not use_opp_model
-
+def play(key, init_ts_th1, init_ts_val1, init_ts_th2, init_ts_val2):
     record = dict(score1=[], score2=[], rr=[], rb=[], br=[], bb=[], score1rec=[], score2rec=[])
 
     print("start iterations with", args.inner_steps, "inner steps and", args.outer_steps, "outer steps:")
@@ -1603,9 +1432,6 @@ if __name__ == "__main__":
     parser.add_argument("--grid_size", type=int, default=3, help="Grid size for Coin Game")
     parser.add_argument("--optim", type=str, default="adam", help="Used only for the outer agent (in the out_lookahead)")
     parser.add_argument("--no_baseline", action="store_true", help="Use NO Baseline (critic) for variance reduction. Default is baseline using Loaded DiCE with GAE")
-    parser.add_argument("--opp_model", action="store_true", help="Use Opponent Modeling")
-    parser.add_argument("--opp_model_steps_per_batch", type=int, default=1, help="How many steps to train opp model on each batch at the beginning of each POLA epoch")
-    parser.add_argument("--opp_model_data_batches", type=int, default=100, help="How many batches of data (right now from rollouts) to train opp model on")
     parser.add_argument("--om_lr_p", type=float, default=0.005,
                         help="learning rate for opponent modeling (imitation/supervised learning) for policy")
     parser.add_argument("--om_lr_v", type=float, default=0.001,
@@ -1625,13 +1451,9 @@ if __name__ == "__main__":
     parser.add_argument("--inspect_ipd", action="store_true", help="Detailed (2 steps + start state) policy information in the IPD with full history")
     parser.add_argument("--layers_before_gru", type=int, default=2, choices=[0, 1, 2], help="Number of linear layers (with ReLU activation) before GRU, supported up to 2 for now")
     parser.add_argument("--contrib_factor", type=float, default=1.33, help="contribution factor to vary difficulty of IPD")
-
     args = parser.parse_args()
 
     np.random.seed(args.seed)
-
-
-
     if args.env == 'coin':
         assert args.grid_size == 3  # rest not implemented yet
         input_size = args.grid_size ** 2 * 4
@@ -1646,13 +1468,8 @@ if __name__ == "__main__":
     vec_env_reset = jax.vmap(env.reset)
     vec_env_step = jax.vmap(env.step)
 
-
-
     key = jax.random.PRNGKey(args.seed)
-
-
-    ts_th1, ts_val1, ts_th2, ts_val2 = get_init_tss(key, action_size, input_size)
-
+    ts_th1, ts_val1, ts_th2, ts_val2 = get_init_trainstates(key, action_size, input_size)
 
     if args.load_dir is not None:
         epoch_num = int(args.load_prefix.split("epoch")[-1])
@@ -1683,7 +1500,6 @@ if __name__ == "__main__":
 
         ts_th1, ts_val1, ts_th2, ts_val2, coins_collected_info, score_record, vs_fixed_strats_score_record = restored_tuple
 
-
     use_baseline = True
     if args.no_baseline:
         use_baseline = False
@@ -1693,5 +1509,4 @@ if __name__ == "__main__":
     assert args.outer_steps >= 1
 
 
-    joint_scores = play(key, ts_th1, ts_val1, ts_th2, ts_val2,
-                        args.opp_model)
+    joint_scores = play(key, ts_th1, ts_val1, ts_th2, ts_val2)
