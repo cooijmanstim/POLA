@@ -33,6 +33,8 @@ from flax.training import checkpoints
 from coin_game_jax import CoinGame
 from ipd_jax import IPD
 
+deepmap = jax.tree_util.tree_map
+
 @struct.dataclass
 class Agent:
     pol: "TrainState"
@@ -44,110 +46,42 @@ class Agent:
         return self.replace(pol=self.pol.replace(params=params["pol"]),
                             val=self.val.replace(params=params["val"]) if use_baseline else self.val)
     def apply_gradients(self, grad):
-        return self.replace(pol=self.pol.apply_gradients(grad["pol"]),
-                            val=self.val.apply_gradients(grad["val"]) if use_baseline else self.val)
+        return self.replace(pol=self.pol.apply_gradients(grads=grad["pol"]),
+                            val=self.val.apply_gradients(grads=grad["val"]) if use_baseline else self.val)
 
-def reverse_cumsum(x, axis):
-    return x + jnp.sum(x, axis=axis, keepdims=True) - jnp.cumsum(x, axis=axis)
+    def init_state(self, batch_size):
+        # obtain the module through the apply_fn -__-
+        return dict(pol=self.pol.apply_fn.__self__.init_state(batch_size),
+                    val=self.val.apply_fn.__self__.init_state(batch_size) if use_baseline else None)
 
-@jit
-def magic_box(x):
-    return jnp.exp(x - jax.lax.stop_gradient(x))
+    @classmethod
+    def make(cls, key, action_size, input_size):
+        if args.architecture == "rnn":
+          pol = RNN(num_outputs=action_size, num_hidden_units=args.hidden_size,
+                    layers_before_gru=args.layers_before_gru)
+          val = RNN(num_outputs=1, num_hidden_units=args.hidden_size,
+                    layers_before_gru=args.layers_before_gru)
+        elif args.architecture == "conv":
+          pol = Conv(num_outputs=action_size, num_hidden_units=args.hidden_size, window=3)
+          val = Conv(num_outputs=1, num_hidden_units=args.hidden_size, window=3)
+        else: raise KeyError(args.architecture)
 
-@jit
-def update_gae_with_delta_backwards(gae, delta):
-    gae = gae * args.gamma * args.gae_lambda + delta
-    return gae, gae
+        key_pol, key_val = jax.random.split(key)
+        pol_params = pol.init_params(key_pol, jnp.ones([args.batch_size, input_size]))
+        val_params = val.init_params(key_val, jnp.ones([args.batch_size, input_size]))
 
-@jit
-def get_gae_advantages(rewards, values, next_val_history):
-    deltas = rewards + args.gamma * jax.lax.stop_gradient(next_val_history) - jax.lax.stop_gradient(values)
-    gae = jnp.zeros_like(deltas[0, :])
-    deltas = jnp.flip(deltas, axis=0)
-    gae, flipped_advantages = jax.lax.scan(update_gae_with_delta_backwards, gae, deltas, deltas.shape[0])
-    advantages = jnp.flip(flipped_advantages, axis=0)
-    return advantages
+        if args.optim.lower() == 'adam':
+            pol_optimizer = optax.adam(learning_rate=args.lr_out)
+            val_optimizer = optax.adam(learning_rate=args.lr_v)
+        elif args.optim.lower() == 'sgd':
+            pol_optimizer = optax.sgd(learning_rate=args.lr_out)
+            val_optimizer = optax.sgd(learning_rate=args.lr_v)
+        else:
+            raise Exception("Unknown or Not Implemented Optimizer")
 
-@jit
-def dice_objective(self_logprobs, other_logprobs, rewards, values, end_state_v):
-    cum_discount = jnp.cumprod(args.gamma * jnp.ones(rewards.shape), axis=0) / args.gamma
-    discounted_rewards = rewards * cum_discount
-    stochastic_nodes = self_logprobs + other_logprobs
-
-    if use_baseline:
-        assert values.shape[0] == args.rollout_len  # if so, use concatenate to construct this
-        next_val_history = jnp.zeros((args.rollout_len, args.batch_size))
-        next_val_history = next_val_history.at[:args.rollout_len-1,:].set(values[1:args.rollout_len,:])
-        next_val_history = next_val_history.at[-1, :].set(end_state_v)
-
-        if args.zero_vals:
-            next_val_history = jnp.zeros_like(next_val_history)
-            values = jnp.zeros_like(values)
-
-        advantages = get_gae_advantages(rewards, values, next_val_history)
-        discounted_advantages = advantages * cum_discount
-        deps_up_to_t = jnp.cumsum(stochastic_nodes, axis=0)  # == `dependencies`?
-        deps_less_than_t = deps_up_to_t - stochastic_nodes  # take out the dependency in the given time step
-
-        # Look at Loaded DiCE and GAE papers to see where this formulation comes from
-        dice_obj = ((magic_box(deps_up_to_t) - magic_box(deps_less_than_t))
-                    * discounted_advantages).sum(axis=0).mean()
-    else:
-        # dice objective:
-        # REMEMBER that in this jax code the axis 0 is the rollout_len (number of time steps in the environment)
-        # and axis 1 is the batch.
-        dependencies = jnp.cumsum(stochastic_nodes, axis=0)
-        dice_obj = (magic_box(dependencies) * discounted_rewards).sum(axis=0).mean()
-    return -dice_obj  # want to minimize -objective
-
-@jit
-def dice_objective_plus_value_loss(self_logprobs, other_logprobs, rewards, values, end_state_v):
-    # Essentially a wrapper function for the objective to put all the control flow in one spot
-    # The reasoning behind this function here is that the reward_loss has a stop_gradient
-    # on all of the nodes related to the value function
-    # and the value function has no nodes related to the policy
-    # Then we can actually take the respective grads like the way I have things set up now
-    # And I should be able to update both policy and value functions
-    reward_loss = dice_objective(self_logprobs, other_logprobs, rewards, values, end_state_v)
-    if use_baseline:
-        val_loss = value_loss(rewards, values, end_state_v)
-        return reward_loss + val_loss
-    else:
-        return reward_loss
-
-@jit
-def value_loss(rewards, values, final_state_vals):
-    final_state_vals = jax.lax.stop_gradient(final_state_vals)
-    discounts = jnp.cumprod(args.gamma * jnp.ones(rewards.shape), axis=0) / args.gamma
-    gamma_t_r_ts = rewards * discounts
-    G_ts = reverse_cumsum(gamma_t_r_ts, axis=0)
-    R_ts = G_ts / discounts
-    final_val_discounted_to_curr = (args.gamma * jnp.flip(discounts, axis=0)) * final_state_vals
-    # You DO need a detach on these. Because it's the target - it should be detached. It's a target value.
-    # Essentially a Monte Carlo style type return for R_t, except for the final state we also use the estimated final state value.
-    # This becomes our target for the value function loss. So it's kind of a mix of Monte Carlo and bootstrap, but anyway you need the final value
-    # because otherwise your value calculations will be inconsistent
-    # TODO(cooijmat) figure out if we do or do not need a detach here then
-    values_loss = (R_ts + final_val_discounted_to_curr - values) ** 2
-    values_loss = values_loss.sum(axis=0).mean()
-    return values_loss
-
-@jit
-def act(key, agent, astate, obs):
-    new_astate = dict()
-    new_astate["pol"], logits = agent.pol.apply_fn(agent.pol.params, obs, astate["pol"])
-    logits = nn.log_softmax(logits)
-    if use_baseline:
-        new_astate["val"], values = agent.val.apply_fn(agent.val.params, obs, astate["val"])
-        ret_vals = values.squeeze(-1)
-    else:
-        new_astate["val"], values = None, None
-        ret_vals = None
-    key, subkey = jax.random.split(key)
-    actions = jax.random.categorical(subkey, logits)
-    logps = jax.vmap(lambda z, a: z[a])(logits, actions)
-    return dict(a=actions, l=logits, v=values, astate=new_astate,
-                logp=logps, p=jp.exp(logits))
+        pol_ts = TrainState.create(apply_fn=pol.apply, params=pol_params, tx=pol_optimizer)
+        val_ts = TrainState.create(apply_fn=val.apply, params=val_params, tx=val_optimizer)
+        return Agent(pol=pol_ts, val=val_ts)
 
 class RNN(nn.Module):
     num_outputs: int
@@ -172,88 +106,216 @@ class RNN(nn.Module):
         outputs = self.linear_end(x)
         return carry, outputs
 
-@jit
+    @nn.nowrap
+    def init_state(self, batch_size):
+        return jnp.zeros([batch_size, self.num_hidden_units])
+
+    @nn.nowrap
+    def init_params(self, key, x):
+        return self.init(key, x, self.init_state(x.shape[0]))
+
+class Conv(nn.Module):
+    num_outputs: int
+    num_hidden_units: int
+    window: int = 3
+
+    def setup(self):
+        self.linear1 = nn.Dense(features=self.num_hidden_units)
+        self.filter = nn.Dense(features=self.num_hidden_units)
+        self.linear_end = nn.Dense(features=self.num_outputs)
+
+    def __call__(self, x, queue):
+        x = nn.relu(self.linear1(x))
+        assert len(queue) == self.window
+        queue = [*queue[:-1], x]
+        x = nn.relu(self.filter(jnp.concatenate(queue, axis=-1)))
+        y = self.linear_end(x)
+        return queue, y
+
+    @nn.nowrap
+    def init_state(self, batch_size):
+        return [jnp.zeros([batch_size, self.num_hidden_units])
+                for _ in range(self.window)]
+
+    @nn.nowrap
+    def init_params(self, key, x):
+        return self.init(key, x, self.init_state(x.shape[0]))
+
+def reverse_cumsum(x, axis):
+    return x + jnp.sum(x, axis=axis, keepdims=True) - jnp.cumsum(x, axis=axis)
+
+#@jit
+def magic_box(x):
+    return jnp.exp(x - jax.lax.stop_gradient(x))
+
+#@jit
+def update_gae_with_delta_backwards(gae, delta):
+    gae = gae * args.gamma * args.gae_lambda + delta
+    return gae, gae
+
+#@jit
+def get_gae_advantages(rewards, values, next_val_history):
+    deltas = rewards + args.gamma * jax.lax.stop_gradient(next_val_history) - jax.lax.stop_gradient(values)
+    gae = jnp.zeros_like(deltas[0, :])
+    deltas = jnp.flip(deltas, axis=0)
+    gae, flipped_advantages = jax.lax.scan(update_gae_with_delta_backwards, gae, deltas, deltas.shape[0])
+    advantages = jnp.flip(flipped_advantages, axis=0)
+    return advantages
+
+#@jit
+def dice_objective(self_logprobs, other_logprobs, rewards, values, end_state_v):
+    cum_discount = jnp.cumprod(args.gamma * jnp.ones(rewards.shape), axis=0) / args.gamma
+    discounted_rewards = rewards * cum_discount
+    stochastic_nodes = self_logprobs + other_logprobs
+
+    if use_baseline:
+        assert values.shape[0] == args.rollout_len  # if so, use concatenate to construct this
+        next_val_history = jnp.zeros((args.rollout_len, args.batch_size))
+        next_val_history = next_val_history.at[:args.rollout_len-1].set(values[1:args.rollout_len])
+        next_val_history = next_val_history.at[-1].set(end_state_v)
+
+        if args.zero_vals:
+            next_val_history = jnp.zeros_like(next_val_history)
+            values = jnp.zeros_like(values)
+
+        advantages = get_gae_advantages(rewards, values, next_val_history)
+        discounted_advantages = advantages * cum_discount
+        deps_up_to_t = jnp.cumsum(stochastic_nodes, axis=0)  # == `dependencies`?
+        deps_less_than_t = deps_up_to_t - stochastic_nodes  # take out the dependency in the given time step
+
+        # Look at Loaded DiCE and GAE papers to see where this formulation comes from
+        dice_obj = ((magic_box(deps_up_to_t) - magic_box(deps_less_than_t))
+                    * discounted_advantages).sum(axis=0).mean()
+    else:
+        # dice objective:
+        # REMEMBER that in this jax code the axis 0 is the rollout_len (number of time steps in the environment)
+        # and axis 1 is the batch.
+        dependencies = jnp.cumsum(stochastic_nodes, axis=0)
+        dice_obj = (magic_box(dependencies) * discounted_rewards).sum(axis=0).mean()
+    return -dice_obj  # want to minimize -objective
+
+#@jit
+def dice_objective_plus_value_loss(self_logprobs, other_logprobs, rewards, values, end_state_v):
+    # Essentially a wrapper function for the objective to put all the control flow in one spot
+    # The reasoning behind this function here is that the reward_loss has a stop_gradient
+    # on all of the nodes related to the value function
+    # and the value function has no nodes related to the policy
+    # Then we can actually take the respective grads like the way I have things set up now
+    # And I should be able to update both policy and value functions
+    reward_loss = dice_objective(self_logprobs, other_logprobs, rewards, values, end_state_v)
+    if use_baseline:
+        val_loss = value_loss(rewards, values, end_state_v)
+        return reward_loss + val_loss
+    else:
+        return reward_loss
+
+#@jit
+def value_loss(rewards, values, final_state_vals):
+    final_state_vals = jax.lax.stop_gradient(final_state_vals)
+    discounts = jnp.cumprod(args.gamma * jnp.ones(rewards.shape), axis=0) / args.gamma
+    gamma_t_r_ts = rewards * discounts
+    G_ts = reverse_cumsum(gamma_t_r_ts, axis=0)
+    R_ts = G_ts / discounts
+    final_val_discounted_to_curr = (args.gamma * jnp.flip(discounts, axis=0)) * final_state_vals
+    # You DO need a detach on these. Because it's the target - it should be detached. It's a target value.
+    # Essentially a Monte Carlo style type return for R_t, except for the final state we also use the estimated final state value.
+    # This becomes our target for the value function loss. So it's kind of a mix of Monte Carlo and bootstrap, but anyway you need the final value
+    # because otherwise your value calculations will be inconsistent
+    # TODO(cooijmat) figure out if we do or do not need a detach here then
+    values_loss = (R_ts + final_val_discounted_to_curr - values) ** 2
+    values_loss = values_loss.sum(axis=0).mean()
+    return values_loss
+
+#@jit
+def act(key, agent, astate, obs):
+    new_astate = dict()
+    new_astate["pol"], logits = agent.pol.apply_fn(agent.pol.params, obs, astate["pol"])
+    if use_baseline:
+        new_astate["val"], values = agent.val.apply_fn(agent.val.params, obs, astate["val"])
+        values = values.squeeze(-1)
+    else:
+        new_astate["val"], values = None, None
+    key, subkey = jax.random.split(key)
+    logits = nn.log_softmax(logits)
+    actions = jax.random.categorical(subkey, logits)
+    logps = jax.vmap(lambda z, a: z[a])(logits, actions)
+    return dict(a=actions, l=logits, v=values, astate=new_astate,
+                logp=logps, p=jnp.exp(logits))
+
+#@jit
 def _scan_act(key, agent, astate, obsseq):
     key, subkey = jax.random.split(key)
-    def body_fn(carry, obs):
-      key, astate = carry
-      key, subkey = jax.random.split(key)
-      aux = act(subkey, obs, agent, astate)
-      return (key, aux["astate"]), aux
+    @jax.named_call
+    def scan_act_body(carry, obs):
+        key, astate = carry
+        key, subkey = jax.random.split(key)
+        aux = act(subkey, agent, astate, obs)
+        return (key, aux["astate"]), (aux["p"], aux["v"])
     obsseq = jnp.stack(obsseq[:args.rollout_len], axis=0) # TODO(cooijmat) stack this in caller
-    carry, aux = jax.lax.scan(body_fn, (key, astate), obsseq, args.rollout_len)
+    carry, aux = jax.lax.scan(scan_act_body, (subkey, astate), obsseq, args.rollout_len)
     return aux
 
-@jit
+#@jit
 def scan_act(key, agent, obsseq):
-    h_p = jnp.zeros((args.batch_size, args.hidden_size))
-    h_v = None
-    if use_baseline:
-        h_v = jnp.zeros((args.batch_size, args.hidden_size))
-    astate = dict(pol=h_p, val=h_v)
+    astate = agent.init_state(args.batch_size)
     return _scan_act(key, agent, astate, obsseq)
 
-@jit
+#@jit
 def scan_act_onebatch(key, agent, obsseq):
-    h_p = jnp.zeros((1, args.hidden_size))
-    h_v = None
-    if use_baseline:
-        h_v = jnp.zeros((1, args.hidden_size))
-    astate = dict(pol=h_p, val=h_v)
+    astate = agent.init_state(1)
     return _scan_act(key, agent, astate, obsseq)
 
 def get_policies_for_states(key, agent, obsseq):
-  return scan_act(key, agent, obsseq)["p"]
+    return scan_act(key, agent, obsseq)[0]
+def get_policies_for_states_onebatch(key, agent, obsseq):
+    return scan_act_onebatch(key, agent, obsseq)[0]
 
 def dicttranspose(dikts):
     assert all(set(dikt) == set(dikts[0]) for dikt in dikts[1:])
     return {key: [dikt[key] for dikt in dikts] for key in dikts[0]}
 
-@jit
 def env_step(key, env_state, obss, agents, astates):
     key, sk1, sk2, skenv = jax.random.split(key, 4)
     subkeys = [sk1, sk2]
-    aux = dicttranspose([act(*args) for args in zip(subkeys, obss, agents, astates)])
+    aux = dicttranspose([act(*args) for args in zip(subkeys, agents, astates, obss)])
     skenv = jax.random.split(skenv, args.batch_size)
     env_state, new_obs, rewards, aux_info = vec_env_step(env_state, *aux["a"], skenv)
     new_obss = [new_obs, new_obs]
     stuff = (key, env_state, new_obss, aux["astate"])
     return stuff, (dict(obss=new_obss, r=rewards, p=aux["p"], logp=aux["logp"], v=aux["v"], a=aux["a"]), aux_info)
 
-@partial(jit, static_argnums=(9))
 def do_env_rollout(key, agents, agent_for_state_history):
     keys = jax.random.split(key, args.batch_size + 1)
     key, env_subkeys = keys[0], keys[1:]
     env_state, obsv = vec_env_reset(env_subkeys)
     obss = [obsv, obsv]
-    astates = get_init_hidden_states()
+    astates = [agent.init_state(args.batch_size) for agent in agents]
 
-    def body_fn(carry, _):
-      (key, env_state, obss, astates) = carry
-      return env_step(key, env_state, obss, agents, astates)
+    @jax.named_call
+    def env_step_body(carry, _):
+        (key, env_state, obss, astates) = carry
+        return env_step(key, env_state, obss, agents, astates)
     carry = (key, env_state, obss, astates)
-    carry, (aux, aux_info) = jax.lax.scan(body_fn, carry, None, args.rollout_len)
+    carry, (aux, aux_info) = jax.lax.scan(env_step_body, carry, None, args.rollout_len)
 
     if agent_for_state_history == 1:
-      obsseq = [obss[0], *aux["obs"][0]]
+        obsseq = [obss[0], *aux["obss"][0]]
     elif agent_for_state_history == 2:
-      obsseq = [obss[1], *aux["obs"][1]]
+        obsseq = [obss[1], *aux["obss"][1]]
     else: raise ValueError(agent_for_state_history)
 
     return carry, aux, obsseq
 
-@jit
 def kl_div_jax(curr, target):
     # TODO(cooijmat) wrong way around??
     return (curr * (jnp.log(curr) - jnp.log(target))).sum(axis=-1).mean()
 
 
-@jit
 def eval_vs_alld_selfagent1(stuff, unused):
     key, agent, env_state, obsv, astate = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, obsv, agent, astate)
+    aux = act(subkey, agent, astate, obsv)
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -279,12 +341,11 @@ def eval_vs_alld_selfagent1(stuff, unused):
     aux = (score1, score2)
     return stuff, aux
 
-@jit
 def eval_vs_alld_selfagent2(stuff, unused):
     key, agent, env_state, obsv, astate = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, obsv, agent, astate)
+    aux = act(subkey, agent, astate, obsv)
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -311,12 +372,11 @@ def eval_vs_alld_selfagent2(stuff, unused):
     aux = (score1, score2)
     return stuff, aux
 
-@jit
 def eval_vs_allc_selfagent1(stuff, unused):
     key, agent, env_state, obsv, astate = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, obsv, agent, astate)
+    aux = act(subkey, agent, astate, obsv)
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -343,12 +403,11 @@ def eval_vs_allc_selfagent1(stuff, unused):
     aux = (score1, score2)
     return stuff, aux
 
-@jit
 def eval_vs_allc_selfagent2(stuff, unused):
     key, agent, env_state, obsv, astate = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, obsv, agent, astate)
+    aux = act(subkey, agent, astate, obsv)
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -375,12 +434,11 @@ def eval_vs_allc_selfagent2(stuff, unused):
     aux = (score1, score2)
     return stuff, aux
 
-@jit
 def eval_vs_tft_selfagent1(stuff, unused):
     key, agent, env_state, obsv, astate, prev_a, prev_agent_coin_collected_same_col, r1, r2 = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, obsv, agent, astate)
+    aux = act(subkey, agent, astate, obsv)
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -415,12 +473,11 @@ def eval_vs_tft_selfagent1(stuff, unused):
     aux = (score1, score2)
     return stuff, aux
 
-@jit
 def eval_vs_tft_selfagent2(stuff, unused):
     key, agent, env_state, obsv, astate, prev_a, prev_agent_coin_collected_same_col, r1, r2 = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, obsv, agent, astate)
+    aux = act(subkey, agent, astate, obsv)
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -455,17 +512,13 @@ def eval_vs_tft_selfagent2(stuff, unused):
     aux = (score1, score2)
     return stuff, aux
 
-@partial(jit, static_argnums=(3, 4))
 def eval_vs_fixed_strategy(key, agent, strat="alld", self_agent=1):
     keys = jax.random.split(key, args.batch_size + 1)
     key, env_subkeys = keys[0], keys[1:]
 
     env_state, obsv = vec_env_reset(env_subkeys) # note this works only with the same obs, otherwise you would have to switch things up a bit here
 
-    h_p = jnp.zeros((args.batch_size, args.hidden_size))
-    h_v = None
-    if use_baseline:
-        h_v = jnp.zeros((args.batch_size, args.hidden_size))
+    astate = agent.init_state(args.batch_size)
 
     if strat == "alld":
         stuff = key, agent, env_state, obsv, astate
@@ -509,20 +562,6 @@ def eval_vs_fixed_strategy(key, agent, strat="alld", self_agent=1):
     score2 = score2.mean()
     return (score1, score2), None
 
-@jit
-def get_init_hidden_states():
-    h_p1, h_p2 = (
-        jnp.zeros((args.batch_size, args.hidden_size)),
-        jnp.zeros((args.batch_size, args.hidden_size))
-    )
-    h_v1, h_v2 = None, None
-    if use_baseline:
-        h_v1, h_v2 = (
-            jnp.zeros((args.batch_size, args.hidden_size)),
-            jnp.zeros((args.batch_size, args.hidden_size))
-        )
-    return [dict(pol=h_p1, val=h_v1), dict(pol=h_p2, val=h_v2)]
-
 def inspect_ipd(agents):
     assert args.env == 'ipd'
     unused_keys = jax.random.split(jax.random.PRNGKey(0), args.batch_size)
@@ -548,8 +587,8 @@ def eval_progress(subkey, agents):
     key, env_subkeys = keys[0], keys[1:]
     env_state, obsv = vec_env_reset(env_subkeys)
     obss = [obsv, obsv]
-    astates = get_init_hidden_states()
-    key, subkey = jax.random.split(key)  # TODO is this missing from do_env_rollout?
+    astates = [agent.init_state(args.batch_size) for agent in agents]
+    key, subkey = jax.random.split(key)
 
     def body_fn(carry, _):
         (key, env_state, obss, astates) = carry
@@ -589,45 +628,6 @@ def eval_progress(subkey, agents):
         return avg_rew1, avg_rew2, rr, rb, br, bb, score1rec, score2rec
     else:
         return avg_rew1, avg_rew2, None, None, None, None, score1rec, score2rec
-
-def get_init_agents(key, action_size, input_size):
-    hidden_size = args.hidden_size
-
-    key, key_p1, key_v1, key_p2, key_v2 = jax.random.split(key, 5)
-
-    theta_p1 = RNN(num_outputs=action_size,
-                   num_hidden_units=hidden_size,
-                   layers_before_gru=args.layers_before_gru)
-    theta_v1 = RNN(num_outputs=1, num_hidden_units=hidden_size,
-                   layers_before_gru=args.layers_before_gru)
-
-    theta_p1_params = theta_p1.init(key_p1, jnp.ones([args.batch_size, input_size]), jnp.zeros(hidden_size))
-    theta_v1_params = theta_v1.init(key_v1, jnp.ones([args.batch_size, input_size]), jnp.zeros(hidden_size))
-
-    theta_p2 = RNN(num_outputs=action_size,
-                   num_hidden_units=hidden_size,
-                   layers_before_gru=args.layers_before_gru)
-    theta_v2 = RNN(num_outputs=1, num_hidden_units=hidden_size,
-                   layers_before_gru=args.layers_before_gru)
-
-    theta_p2_params = theta_p2.init(key_p2, jnp.ones([args.batch_size, input_size]), jnp.zeros(hidden_size))
-    theta_v2_params = theta_v2.init(key_v2, jnp.ones([args.batch_size, input_size]), jnp.zeros(hidden_size))
-
-    if args.optim.lower() == 'adam':
-        theta_optimizer = optax.adam(learning_rate=args.lr_out)
-        value_optimizer = optax.adam(learning_rate=args.lr_v)
-    elif args.optim.lower() == 'sgd':
-        theta_optimizer = optax.sgd(learning_rate=args.lr_out)
-        value_optimizer = optax.sgd(learning_rate=args.lr_v)
-    else:
-        raise Exception("Unknown or Not Implemented Optimizer")
-
-    ts_th1 = TrainState.create(apply_fn=theta_p1.apply, params=theta_p1_params, tx=theta_optimizer)
-    ts_th2 = TrainState.create(apply_fn=theta_p2.apply, params=theta_p2_params, tx=theta_optimizer)
-    ts_val1 = TrainState.create(apply_fn=theta_v1.apply, params=theta_v1_params, tx=value_optimizer)
-    ts_val2 = TrainState.create(apply_fn=theta_v2.apply, params=theta_v2_params, tx=value_optimizer)
-
-    return [Agent(pol=ts_th1, val=ts_val1), Agent(pol=ts_th2, val=ts_val2)]
 
 # outer step functions are called in a plain python loop so should be jitted,
 # and input structure should match output structure
@@ -671,12 +671,12 @@ def inner_update_agent1(key, agent1, agent2):
                                                   tx=optax.sgd(learning_rate=args.lr_v)))
 
     def body_fn(carry, _):
-        key, outer_agent1 = carry
+        key, agent1 = carry
         key, subkey = jax.random.split(key)
         def fn(params):
-          agent1 = outer_agent1.replace_params(params)
-          return in_lookahead(subkey, [agent1, agent2], ref_agent1, other_agent=1)
-        grad = jax.grad(fn)(outer_agent1.extract_params())
+          agent1_ = agent1.replace_params(params)
+          return in_lookahead(subkey, [agent1_, agent2], ref_agent1, other_agent=1)
+        grad = jax.grad(fn)(agent1.extract_params())
         agent1 = agent1.apply_gradients(grad)
         return (key, agent1), None
 
@@ -707,27 +707,27 @@ def inner_update_agent2(key, agent1, agent2):
                                                   tx=optax.sgd(learning_rate=args.lr_v)))
 
     def body_fn(carry, _):
-        key, outer_agent2 = carry
+        key, agent2, params_for_bug1 = carry
         key, subkey = jax.random.split(key)
         def fn(params):
-          agent2 = outer_agent2.replace_params(params)
-          return in_lookahead(subkey, [agent1, agent2], ref_agent2, other_agent=2)
-        grad = jax.grad(fn)(outer_agent2.extract_params())
+            agent2_ = agent2.replace_params(params)
+            return in_lookahead(subkey, [agent1, agent2_], ref_agent2, other_agent=2)
+        grad = jax.grad(fn)(agent2.extract_params())
         agent2 = agent2.apply_gradients(grad)
-        return (key, agent2), None
+        return (key, agent2, agent2.extract_params()), None
 
     key, reused_subkey = jax.random.split(key)
     key, subkey = jax.random.split(key)
     assert not args.old_kl_div
 
     # do one step with reused_subkey as in the original code
-    carry = (reused_subkey, agent2)
+    carry = (reused_subkey, agent2, agent2.extract_params())
     carry, _ = body_fn(carry, None)
     agent2 = carry[1]
 
     key, subkey = jax.random.split(key)
     if args.inner_steps > 1:
-        carry = (subkey, agent2)
+        carry = (subkey, agent2, agent2.extract_params())
         carry, aux = jax.lax.scan(body_fn, carry, None, args.inner_steps - 1)
         agent2 = carry[1]
 
@@ -743,7 +743,7 @@ def in_lookahead(key, agents, ref_agent, other_agent=2):
 
     # act just to get the final state values
     key, *subkeys = jax.random.split(key, 3)
-    auxend = act(subkeys[us], obss[us], agents[us], astates[us])
+    auxend = act(subkeys[us], agents[us], astates[us], obss[us])
     objective = dice_objective_plus_value_loss(self_logprobs=auxseq["logp"][us],
                                                other_logprobs=auxseq["logp"][them],
                                                rewards=auxseq["r"][us],
@@ -769,7 +769,7 @@ def out_lookahead(key, agents, ref_agent, self_agent=1):
 
     # act just to get the final state values
     key, subkey = jax.random.split(key)
-    auxend = act(subkey, obss[us], agents[us], astates[us])
+    auxend = act(subkey, agents[us], astates[us], obss[us])
     objective = dice_objective_plus_value_loss(self_logprobs=auxseq["logp"][us],
                                                other_logprobs=auxseq["logp"][them],
                                                rewards=auxseq["r"][us],
@@ -795,14 +795,14 @@ def update_agents(key, agents):
     key, subkey = jax.random.split(key)
     carry = (subkey, agent1, agents)
     for _ in range(args.outer_steps):
-        carry = one_outer_step_update_selfagent1(carry)
+        carry = one_outer_step_update_selfagent1(*carry)
     agent1 = carry[1]
 
     # --- AGENT 2 UPDATE ---
     key, subkey = jax.random.split(key)
     carry = (subkey, agent2, agents)
     for _ in range(args.outer_steps):
-        carry = one_outer_step_update_selfagent2(carry)
+        carry = one_outer_step_update_selfagent2(*carry)
     agent2 = carry[1]
 
     return key, [agent1, agent2]
@@ -893,6 +893,7 @@ if __name__ == "__main__":
     parser.add_argument("--inspect_ipd", action="store_true", help="Detailed (2 steps + start state) policy information in the IPD with full history")
     parser.add_argument("--layers_before_gru", type=int, default=2, choices=[0, 1, 2], help="Number of linear layers (with ReLU activation) before GRU, supported up to 2 for now")
     parser.add_argument("--contrib_factor", type=float, default=1.33, help="contribution factor to vary difficulty of IPD")
+    parser.add_argument("--architecture", type=str, default="rnn", choices="rnn conv".split())
     args = parser.parse_args()
     assert not args.old_kl_div
 
@@ -912,7 +913,9 @@ if __name__ == "__main__":
     vec_env_step = jax.vmap(env.step)
 
     key = jax.random.PRNGKey(args.seed)
-    agents = get_init_agents(key, action_size, input_size)
+    key, key1, key2 = jax.random.split(key, 3)
+    agents = [Agent.make(key1, action_size, input_size),
+              Agent.make(key2, action_size, input_size)]
 
     if args.load_dir is not None:
         epoch_num = int(args.load_prefix.split("epoch")[-1])
@@ -920,18 +923,6 @@ if __name__ == "__main__":
             epoch_num += 1  # Kind of an ugly temporary fix to allow for the updated checkpointing system which now has
             # record of rewards/eval vs fixed strat before the first training - important for IPD plots. Should really be applied to
             # all checkpoints with the new updated code I have, but the coin checkpoints above are from old code
-
-        score_record = [jnp.zeros((2,))] * epoch_num
-        vs_fixed_strats_score_record = [[jnp.zeros((3,))] * epoch_num,
-                                        [jnp.zeros((3,))] * epoch_num]
-        if args.env == 'coin':
-            same_colour_coins_record = [jnp.zeros((1,))] * epoch_num
-            diff_colour_coins_record = [jnp.zeros((1,))] * epoch_num
-        else:
-            same_colour_coins_record = []
-            diff_colour_coins_record = []
-        coins_collected_info = (
-            same_colour_coins_record, diff_colour_coins_record)
 
         assert args.load_prefix is not None
         agents = checkpoints.restore_checkpoint(ckpt_dir=args.load_dir,
@@ -946,4 +937,4 @@ if __name__ == "__main__":
     # Use 0 lr if you want no inner steps... TODO allow for this functionality (naive learning)?
     assert args.outer_steps >= 1
 
-    joint_scores = play(key, agents)
+    play(key, agents)
