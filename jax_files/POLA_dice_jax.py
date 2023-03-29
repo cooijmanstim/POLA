@@ -899,10 +899,10 @@ if __name__ == "__main__":
 
     np.random.seed(args.seed)
     if args.env == 'coin':
-        assert args.grid_size == 3  # rest not implemented yet
+        #assert args.grid_size == 3  # rest not implemented yet
         input_size = args.grid_size ** 2 * 4
         action_size = 4
-        env = CoinGame()
+        env = CoinGame(grid_size=args.grid_size)
     elif args.env == 'ipd':
         input_size = 6 # 3 * n_agents
         action_size = 2
