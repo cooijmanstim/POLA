@@ -677,13 +677,15 @@ def one_outer_step_update_selfagent1(key, agent1, ref_agents):
     def fn(params, key):
         agent1 = outer_agent1.replace_params(params)
         key, subkey = jax.random.split(key)
-        agent2_ahead = inner_update_agent2(subkey, agent1, ref_agent2)
+        agent2_ahead, gradnorms = inner_update_agent2(subkey, agent1, ref_agent2)
         objective = out_lookahead(key, [agent1, agent2_ahead], ref_agent1, self_agent=1)
-        return objective
+        return objective, gradnorms
     key, subkey = jax.random.split(key)
-    grad = jax.grad(fn)(outer_agent1.extract_params(), subkey)
+    (objective, inner_gradnorms), grad = jax.value_and_grad(fn, has_aux=True)(outer_agent1.extract_params(), subkey)
     agent1 = agent1.apply_gradients(grad)
-    return key, agent1, ref_agents
+    outer_gradnorms = deepmap(lambda x: (x**2).mean(), grad)
+    return (key, agent1, ref_agents), dict(outer_agent1_gradnorms=outer_gradnorms,
+                                           inner_agent2_gradnorms=inner_gradnorms)
 
 @jit
 def one_outer_step_update_selfagent2(key, agent2, ref_agents):
@@ -692,13 +694,15 @@ def one_outer_step_update_selfagent2(key, agent2, ref_agents):
     def fn(params, key):
         agent2 = outer_agent2.replace_params(params)
         key, subkey = jax.random.split(key)
-        agent1_ahead = inner_update_agent1(subkey, ref_agent1, agent2)
+        agent1_ahead, inner_gradnorms = inner_update_agent1(subkey, ref_agent1, agent2)
         objective = out_lookahead(key, [agent1_ahead, agent2], ref_agent2, self_agent=2)
-        return objective
+        return objective, inner_gradnorms
     key, subkey = jax.random.split(key)
-    grad = jax.grad(fn)(outer_agent2.extract_params(), subkey)
+    (objective, inner_gradnorms), grad = jax.value_and_grad(fn, has_aux=True)(outer_agent2.extract_params(), subkey)
     agent2 = agent2.apply_gradients(grad)
-    return key, agent2, ref_agents
+    outer_gradnorms = deepmap(lambda x: (x**2).mean(), grad)
+    return (key, agent2, ref_agents), dict(inner_agent1_gradnorms=inner_gradnorms,
+                                           outer_agent2_gradnorms=outer_gradnorms)
 
 def inner_update_agent1(key, agent1, agent2):
     ref_agent1 = agent1
@@ -717,24 +721,19 @@ def inner_update_agent1(key, agent1, agent2):
           return in_lookahead(subkey, [agent1_, agent2], ref_agent1, other_agent=1)
         grad = jax.grad(fn)(agent1.extract_params())
         agent1 = agent1.apply_gradients(grad)
-        return (key, agent1), None
+        gradnorms = deepmap(lambda x: (x**2).mean(), grad)
+        return (key, agent1), gradnorms
 
-    key, reused_subkey = jax.random.split(key)
-    key, subkey = jax.random.split(key)
     assert not args.old_kl_div
 
-    # do one step with reused_subkey as in the original code
-    carry = (reused_subkey, agent1)
-    carry, _ = body_fn(carry, None)
+    key, subkey = jax.random.split(key)
+    carry = (subkey, agent1)
+    carry, gradnorms = jax.lax.scan(body_fn, carry, None, args.inner_steps)
     agent1 = carry[1]
 
-    key, subkey = jax.random.split(key)
-    if args.inner_steps > 1:
-        carry = (subkey, agent1)
-        carry, aux = jax.lax.scan(body_fn, carry, None, args.inner_steps - 1)
-        agent1 = carry[1]
+    gradnorms = deepmap(lambda x: x.mean(axis=0), gradnorms)  # avg across time
 
-    return agent1
+    return agent1, gradnorms
 
 def inner_update_agent2(key, agent1, agent2):
     ref_agent2 = agent2
@@ -746,31 +745,26 @@ def inner_update_agent2(key, agent1, agent2):
                                                   tx=optax.sgd(learning_rate=args.lr_v)))
 
     def body_fn(carry, _):
-        key, agent2, params_for_bug1 = carry
+        key, agent2 = carry
         key, subkey = jax.random.split(key)
         def fn(params):
             agent2_ = agent2.replace_params(params)
             return in_lookahead(subkey, [agent1, agent2_], ref_agent2, other_agent=2)
         grad = jax.grad(fn)(agent2.extract_params())
         agent2 = agent2.apply_gradients(grad)
-        return (key, agent2, agent2.extract_params()), None
+        gradnorms = deepmap(lambda x: (x**2).mean(), grad)
+        return (key, agent2), gradnorms
 
-    key, reused_subkey = jax.random.split(key)
-    key, subkey = jax.random.split(key)
     assert not args.old_kl_div
 
-    # do one step with reused_subkey as in the original code
-    carry = (reused_subkey, agent2, agent2.extract_params())
-    carry, _ = body_fn(carry, None)
+    key, subkey = jax.random.split(key)
+    carry = (subkey, agent2)
+    carry, gradnorms = jax.lax.scan(body_fn, carry, None, args.inner_steps)
     agent2 = carry[1]
 
-    key, subkey = jax.random.split(key)
-    if args.inner_steps > 1:
-        carry = (subkey, agent2, agent2.extract_params())
-        carry, aux = jax.lax.scan(body_fn, carry, None, args.inner_steps - 1)
-        agent2 = carry[1]
+    gradnorms = deepmap(lambda x: x.mean(axis=0), gradnorms)  # avg across time
 
-    return agent2
+    return agent2, gradnorms
 
 def in_lookahead(key, agents, ref_agent, other_agent=2):
     carry, auxseq, obsseq = do_env_rollout(key, agents, agent_for_state_history=other_agent)
@@ -834,17 +828,17 @@ def update_agents(key, agents):
     key, subkey = jax.random.split(key)
     carry = (subkey, agent1, agents)
     for _ in range(args.outer_steps):
-        carry = one_outer_step_update_selfagent1(*carry)
+        carry, aux1 = one_outer_step_update_selfagent1(*carry)
     agent1 = carry[1]
 
     # --- AGENT 2 UPDATE ---
     key, subkey = jax.random.split(key)
     carry = (subkey, agent2, agents)
     for _ in range(args.outer_steps):
-        carry = one_outer_step_update_selfagent2(*carry)
+        carry, aux2 = one_outer_step_update_selfagent2(*carry)
     agent2 = carry[1]
 
-    return key, [agent1, agent2]
+    return key, [agent1, agent2], {**aux1, **aux2}
 
 # redefine play, simplified so we can actually see what's happening (cooijmat)
 def play(key, update, agents):
