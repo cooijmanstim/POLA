@@ -7,7 +7,7 @@ import math
 # from jnp.distributions import Categorical
 import numpy as np
 import argparse
-import os
+import os, pickle
 import datetime
 
 import jax
@@ -32,6 +32,7 @@ from flax.training import checkpoints
 
 from coin_game_jax import CoinGame
 from ipd_jax import IPD
+import portedagent
 
 deepmap = jax.tree_util.tree_map
 
@@ -808,46 +809,71 @@ def update_agents(key, agents):
     return key, [agent1, agent2]
 
 # redefine play, simplified so we can actually see what's happening (cooijmat)
-def play(key, agents):
-    record = dict(score1=[], score2=[], rr=[], rb=[], br=[], bb=[], score1rec=[], score2rec=[])
+def play(key, update, agents):
+    #record = dict()
 
     print("start iterations with", args.inner_steps, "inner steps and", args.outer_steps, "outer steps:")
 
     key, subkey = jax.random.split(key)
-    score1, score2, rr, rb, br, bb, score1rec, score2rec = eval_progress(key, agents)
-    for k,v in dict(score1=score1,score2=score2,score1rec=score1rec,score2rec=score2rec,rr=rr,rb=rb,br=br,bb=bb).items():
-        record[k].append(v)
+    logframe = eval_progress(subkey,agents)
+    #for k,v in logframe.items():
+    #    record.setdefault(k,[]).append(v)
+    if args.wandb:
+        wandb.log(logframe)
 
-    for update in range(args.n_update):
-        key, agents = update_agents(key, agents)
+    while True:  # update < args.n_update
+        key, agents, optstats = update_agents(key, agents)
+        optstats = {key: {"_".join(map(str, path)): np.array(value)
+                          for path, value in iterate_nested_dict(thing)}
+                    for key, thing in optstats.items()}
+        update += 1
 
         # evaluate progress:
         key, subkey = jax.random.split(key)
-        score1, score2, rr, rb, br, bb, score1rec, score2rec = eval_progress(key, agents)
-        for k,v in dict(score1=score1,score2=score2,score1rec=score1rec,score2rec=score2rec,rr=rr,rb=rb,br=br,bb=bb).items():
-            record[k].append(v)
+        logframe = eval_progress(subkey,agents)
+        #for k,v in logframe.items():
+        #    record[k].append(v)
+        logframe["opt"] = optstats
+        if args.wandb:
+            wandb.log(logframe,step=update)
 
         # print
-        if (update + 1) % args.print_every == 0:
-            print("*" * 10)
-            print("Epoch: {}".format(update + 1), flush=True)
-            print(f"scores {score1} {score2}")
-            if args.env == 'coin':
-                print(f"same {rr+bb} diff {rb+br}")
-                print(f"rr {rr} rb {rb} br {br} bb {bb}")
-            print("Scores vs fixed strats ALLD, ALLC, TFT:")
-            print(score1rec)
-            print(score2rec)
-            if args.env == 'ipd':
-                if args.inspect_ipd:
-                    inspect_ipd(agents)
-        if (update + 1) % args.checkpoint_every == 0:
-            now = datetime.datetime.now()
-            checkpoints.save_checkpoint(ckpt_dir=args.save_dir,
-                                        target=agents,
-                                        step=update + 1, prefix=f"checkpoint_{now.strftime('%Y-%m-%d_%H-%M')}_seed{args.seed}_epoch")
-            np.savez_compressed("record.incoming.npz", **record)
-            os.rename("record.incoming.npz", "record.npz")
+        if update % args.print_every == 0:
+            def printframe(update,score1,score2,rr,rb,br,bb,score1rec,score2rec,**kwargs):
+                print("*" * 10)
+                print("Epoch: {}".format(update), flush=True)
+                print(f"scores {score1} {score2}")
+                if args.env == 'coin':
+                    print(f"same {rr+bb} diff {rb+br}")
+                    print(f"rr {rr} rb {rb} br {br} bb {bb}")
+                print("Scores vs fixed strats ALLD, ALLC, TFT:")
+                print(score1rec)
+                print(score2rec)
+                if args.env == 'ipd':
+                    if args.inspect_ipd:
+                        inspect_ipd(agents)
+            printframe(update,**logframe)
+
+        if update % args.checkpoint_every == 0:
+            checkpoints.save_checkpoint(ckpt_dir=".",
+                                        target=(update,agents),
+                                        step=update,
+                                        prefix="ckpt_epoch")
+            #np.savez_compressed("record.incoming.npz", **record)
+            #os.rename("record.incoming.npz", "record.npz")
+
+        if update % 100 == 0:
+            portedagent.dump_paramss([agent.extract_params()["pol"] for agent in agents],
+                                     f"agents_epoch{update}.pkl")
+
+from collections import abc
+def iterate_nested_dict(node):
+    if not isinstance(node, abc.Mapping):
+        yield (), node
+    else:
+        for key, child in node.items():
+            for path, leaf in iterate_nested_dict(child):
+                yield (key, *path), leaf
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("POLA")
@@ -868,10 +894,7 @@ if __name__ == "__main__":
     parser.add_argument("--print_every", type=int, default=1, help="Print every x number of epochs")
     parser.add_argument("--outer_beta", type=float, default=0.0, help="for outer kl penalty with POLA")
     parser.add_argument("--inner_beta", type=float, default=0.0, help="for inner kl penalty with POLA")
-    parser.add_argument("--save_dir", type=str, default='.', help="Where to save checkpoints")
     parser.add_argument("--checkpoint_every", type=int, default=50, help="Epochs between checkpoint save")
-    parser.add_argument("--load_dir", type=str, default=None, help="Directory for loading checkpoint")
-    parser.add_argument("--load_prefix", type=str, default=None, help="Prefix for loading checkpoint")
     parser.add_argument("--diff_coin_reward", type=float, default=1.0, help="changes problem setting (the reward for picking up coin of different colour)")
     parser.add_argument("--diff_coin_cost", type=float, default=-2.0, help="changes problem setting (the cost to the opponent when you pick up a coin of their colour)")
     parser.add_argument("--same_coin_reward", type=float, default=1.0, help="changes problem setting (the reward for picking up coin of same colour)")
@@ -894,8 +917,14 @@ if __name__ == "__main__":
     parser.add_argument("--layers_before_gru", type=int, default=2, choices=[0, 1, 2], help="Number of linear layers (with ReLU activation) before GRU, supported up to 2 for now")
     parser.add_argument("--contrib_factor", type=float, default=1.33, help="contribution factor to vary difficulty of IPD")
     parser.add_argument("--architecture", type=str, default="rnn", choices="rnn conv".split())
+    parser.add_argument("--wandb", action="store_true")
     args = parser.parse_args()
     assert not args.old_kl_div
+
+    if args.wandb:
+        import wandb
+        wandb.init(project="pola", resume=True)
+        wandb.config.update(args)
 
     np.random.seed(args.seed)
     if args.env == 'coin':
@@ -916,18 +945,11 @@ if __name__ == "__main__":
     key, key1, key2 = jax.random.split(key, 3)
     agents = [Agent.make(key1, action_size, input_size),
               Agent.make(key2, action_size, input_size)]
-
-    if args.load_dir is not None:
-        epoch_num = int(args.load_prefix.split("epoch")[-1])
-        if epoch_num % 10 == 0:
-            epoch_num += 1  # Kind of an ugly temporary fix to allow for the updated checkpointing system which now has
-            # record of rewards/eval vs fixed strat before the first training - important for IPD plots. Should really be applied to
-            # all checkpoints with the new updated code I have, but the coin checkpoints above are from old code
-
-        assert args.load_prefix is not None
-        agents = checkpoints.restore_checkpoint(ckpt_dir=args.load_dir,
-                                                target=agents,
-                                                prefix=args.load_prefix)
+    update,agents = checkpoints.restore_checkpoint(ckpt_dir=".",
+                                                   target=(0,agents),
+                                                   prefix="ckpt_epoch")
+    if update > 0:
+      print("resuming after", update, "updates")
 
     use_baseline = True
     if args.no_baseline:
@@ -937,4 +959,4 @@ if __name__ == "__main__":
     # Use 0 lr if you want no inner steps... TODO allow for this functionality (naive learning)?
     assert args.outer_steps >= 1
 
-    play(key, agents)
+    play(key, update, agents)
