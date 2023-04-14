@@ -576,20 +576,60 @@ def inspect_ipd(agents):
     # Build state history artificially for all combs, and pass those into the pol_probs.
 
 @jit
-def eval_progress(subkey, agents):
-    keys = jax.random.split(subkey, args.batch_size + 1)
+def train_exploiters_step(key, agents, exploiters):
+    exploiters_ = exploiters
+    def fn(paramss):
+        exploiters = [e.replace_params(params) for e,params in zip(exploiters_,paramss)]
+        carry0,auxseq0,_ = do_env_rollout(key, [exploiters[0],agents[1]], agent_for_state_history=1)
+        carry1,auxseq1,_ = do_env_rollout(key, [agents[0],exploiters[1]], agent_for_state_history=1)
+        (_,_,[obs0,_],[astate0,_]) = carry0
+        (_,_,[_,obs1],[_,astate1]) = carry1
+        auxend0 = act(jax.random.PRNGKey(1), exploiters[0], astate0, obs0)
+        auxend1 = act(jax.random.PRNGKey(1), exploiters[1], astate1, obs1)
+        d0 = dice_objective_plus_value_loss(self_logprobs=auxseq0["logp"][0],
+                                            other_logprobs=auxseq0["logp"][1],
+                                            rewards=auxseq0["r"][0],
+                                            values=auxseq0["v"][0],
+                                            end_state_v=auxend0["v"])
+        d1 = dice_objective_plus_value_loss(self_logprobs=auxseq1["logp"][1],
+                                            other_logprobs=auxseq1["logp"][0],
+                                            rewards=auxseq1["r"][1],
+                                            values=auxseq1["v"][1],
+                                            end_state_v=auxend1["v"])
+        return d0+d1
+    grads = jax.grad(fn)([e.extract_params() for e in exploiters])
+    exploiters = [exploiter.apply_gradients(grad) for exploiter,grad in zip(exploiters,grads)]
+    return exploiters
+def train_exploiters(key, agents):
+    key, key1,key2 = jax.random.split(key,3)
+    exploiters = [Agent.make(key1, action_size, input_size),
+                  Agent.make(key2, action_size, input_size)]
+    for _ in range(300):  # enough?
+        key, subkey = jax.random.split(key)
+        exploiters = train_exploiters_step(subkey, agents, exploiters)
+    [rx2,ra2],_ = eval_matchup(key, [exploiters[0],agents[1]])
+    [ra1,rx1],_ = eval_matchup(key, [agents[0],exploiters[1]])
+    return dict(rx1=rx1.mean(), ra1=ra1.mean(), ra2=ra2.mean(), rx2=rx2.mean())
+
+@jit
+def eval_matchup(key, agents):
+    keys = jax.random.split(key, args.batch_size + 1)
     key, env_subkeys = keys[0], keys[1:]
     env_state, obss = vec_env_reset(env_subkeys)
     astates = [agent.init_state(args.batch_size) for agent in agents]
     key, subkey = jax.random.split(key)
-
     def body_fn(carry, _):
         (key, env_state, obss, astates) = carry
         return env_step(key, env_state, obss, agents, astates)
     carry = (subkey, env_state, obss, astates)
     carry, (aux, aux_info) = jax.lax.scan(body_fn, carry, None, args.rollout_len)
+    return aux["r"], aux_info
 
-    [r1,r2] = aux["r"]
+@jit
+def eval_progress_1(key, agents):
+    key, subkey = jax.random.split(key)
+
+    [r1,r2],aux_info = eval_matchup(subkey, agents)
 
     score1rec = []
     score2rec = []
@@ -609,18 +649,24 @@ def eval_progress(subkey, agents):
     score1rec = jnp.stack(score1rec)
     score2rec = jnp.stack(score2rec)
 
-    avg_rew1 = r1.mean()
-    avg_rew2 = r2.mean()
-
     if args.env == 'coin':
         rr, rb, br, bb = aux_info
         rr = rr.sum(axis=0).mean()
         rb = rb.sum(axis=0).mean()
         br = br.sum(axis=0).mean()
         bb = bb.sum(axis=0).mean()
-        return avg_rew1, avg_rew2, rr, rb, br, bb, score1rec, score2rec
     else:
-        return avg_rew1, avg_rew2, None, None, None, None, score1rec, score2rec
+        rr,rb,br,bb = 4*[None]
+    return dict(score1=r1.mean(),score2=r2.mean(),score1rec=score1rec,score2rec=score2rec,
+                rr=rr,rb=rb,br=br,bb=bb)
+
+def eval_progress(key, agents):
+    key, subkey1, subkey2 = jax.random.split(key,3)
+    aux = eval_progress_1(subkey1, agents)
+    ex = train_exploiters(subkey2, agents)
+    return dict(score1x=ex["rx1"],score1a=ex["ra1"],
+                score2x=ex["rx2"],score2a=ex["ra2"],
+                **aux)
 
 # outer step functions are called in a plain python loop so should be jitted,
 # and input structure should match output structure
