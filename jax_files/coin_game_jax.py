@@ -53,10 +53,10 @@ class CoinGame:
         step_count = jnp.zeros([], dtype="int32")
         is_red_coin = jax.random.randint(sk3, shape=[], minval=0, maxval=2).astype("bool")
         state = CoinGameState(red_pos, blue_pos, coin_pos, is_red_coin, step_count)
-        obs = self.state_to_obs(state)
-        return state, obs
+        obss = self.state_to_obss(state)
+        return state, obss
 
-    def state_to_obs(self, state: CoinGameState) -> jnp.ndarray:
+    def state_to_obss(self, state: CoinGameState) -> jnp.ndarray:
         obs = jnp.zeros((4, self.grid_size, self.grid_size))
         obs = obs.at[0, state.red_pos[0], state.red_pos[1]].set(1.0)
         obs = obs.at[1, state.blue_pos[0], state.blue_pos[1]].set(1.0)
@@ -64,8 +64,8 @@ class CoinGame:
         obs = obs.at[2, state.coin_pos[0], state.coin_pos[1]].set(state.is_red_coin)
         # blue coin pos
         obs = obs.at[3, state.coin_pos[0], state.coin_pos[1]].set(~state.is_red_coin)
-        obs = obs.reshape(4*self.grid_size**2)
-        return obs
+        obss = [obs, obs[((1,0,3,2),)]] # flip perspective for blue player
+        return [obs.reshape(4*self.grid_size**2) for obs in obss] # flatten
 
     def step(self, state: CoinGameState, action_0: int, action_1: int, subkey: jnp.ndarray) -> Tuple[jnp.ndarray, list]:
         new_red_pos = (state.red_pos + MOVES[action_0]) % self.grid_size
@@ -86,8 +86,8 @@ class CoinGame:
 
         new_state = CoinGameState(new_red_pos, new_blue_pos, new_coin_pos, new_is_red_coin,
                                   state.step_count+1)
-        obs = self.state_to_obs(new_state)
-        return new_state, obs, (red_reward, blue_reward), (rr, rb, br, bb)
+        obss = self.state_to_obss(new_state)
+        return new_state, obss, (red_reward, blue_reward), (rr, rb, br, bb)
 
     def get_moves_shortest_path_to_coin(self, state, red_agent_perspective=True):
         # Ties broken arbitrarily, in this case, since I check the vertical distance later

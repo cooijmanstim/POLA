@@ -280,16 +280,14 @@ def env_step(key, env_state, obss, agents, astates):
     subkeys = [sk1, sk2]
     aux = dicttranspose([act(*args) for args in zip(subkeys, agents, astates, obss)])
     skenv = jax.random.split(skenv, args.batch_size)
-    env_state, new_obs, rewards, aux_info = vec_env_step(env_state, *aux["a"], skenv)
-    new_obss = [new_obs, new_obs]
+    env_state, new_obss, rewards, aux_info = vec_env_step(env_state, *aux["a"], skenv)
     stuff = (key, env_state, new_obss, aux["astate"])
     return stuff, (dict(obss=new_obss, r=rewards, p=aux["p"], logp=aux["logp"], v=aux["v"], a=aux["a"]), aux_info)
 
 def do_env_rollout(key, agents, agent_for_state_history):
     keys = jax.random.split(key, args.batch_size + 1)
     key, env_subkeys = keys[0], keys[1:]
-    env_state, obsv = vec_env_reset(env_subkeys)
-    obss = [obsv, obsv]
+    env_state, obss = vec_env_reset(env_subkeys)
     astates = [agent.init_state(args.batch_size) for agent in agents]
 
     @jax.named_call
@@ -313,10 +311,10 @@ def kl_div_jax(curr, target):
 
 
 def eval_vs_alld_selfagent1(stuff, unused):
-    key, agent, env_state, obsv, astate = stuff
+    key, agent, env_state, obss, astate = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, agent, astate, obsv)
+    aux = act(subkey, agent, astate, obss[0])
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -332,21 +330,20 @@ def eval_vs_alld_selfagent1(stuff, unused):
 
     a1 = a
     a2 = a_opp
-    env_state, new_obs, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
-    obsv = new_obs
+    env_state, obss, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
 
     score1 = r1.mean()
     score2 = r2.mean()
 
-    stuff = (key, agent, env_state, obsv, astate)
+    stuff = (key, agent, env_state, obss, astate)
     aux = (score1, score2)
     return stuff, aux
 
 def eval_vs_alld_selfagent2(stuff, unused):
-    key, agent, env_state, obsv, astate = stuff
+    key, agent, env_state, obss, astate = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, agent, astate, obsv)
+    aux = act(subkey, agent, astate, obss[1])
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -363,21 +360,20 @@ def eval_vs_alld_selfagent2(stuff, unused):
     a2 = a
     a1 = a_opp
 
-    env_state, new_obs, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
-    obsv = new_obs
+    env_state, obss, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
 
     score1 = r1.mean()
     score2 = r2.mean()
 
-    stuff = (key, agent, env_state, obsv, astate)
+    stuff = (key, agent, env_state, obss, astate)
     aux = (score1, score2)
     return stuff, aux
 
 def eval_vs_allc_selfagent1(stuff, unused):
-    key, agent, env_state, obsv, astate = stuff
+    key, agent, env_state, obss, astate = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, agent, astate, obsv)
+    aux = act(subkey, agent, astate, obss[0])
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -394,21 +390,20 @@ def eval_vs_allc_selfagent1(stuff, unused):
     a1 = a
     a2 = a_opp
 
-    env_state, new_obs, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
-    obsv = new_obs
+    env_state, obss, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
 
     score1 = r1.mean()
     score2 = r2.mean()
 
-    stuff = (key, agent, env_state, obsv, astate)
+    stuff = (key, agent, env_state, obss, astate)
     aux = (score1, score2)
     return stuff, aux
 
 def eval_vs_allc_selfagent2(stuff, unused):
-    key, agent, env_state, obsv, astate = stuff
+    key, agent, env_state, obss, astate = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, agent, astate, obsv)
+    aux = act(subkey, agent, astate, obss[1])
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -425,21 +420,20 @@ def eval_vs_allc_selfagent2(stuff, unused):
     a2 = a
     a1 = a_opp
 
-    env_state, new_obs, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
-    obsv = new_obs
+    env_state, obss, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
 
     score1 = r1.mean()
     score2 = r2.mean()
 
-    stuff = (key, agent, env_state, obsv, astate)
+    stuff = (key, agent, env_state, obss, astate)
     aux = (score1, score2)
     return stuff, aux
 
 def eval_vs_tft_selfagent1(stuff, unused):
-    key, agent, env_state, obsv, astate, prev_a, prev_agent_coin_collected_same_col, r1, r2 = stuff
+    key, agent, env_state, obss, astate, prev_a, prev_agent_coin_collected_same_col, r1, r2 = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, agent, astate, obsv)
+    aux = act(subkey, agent, astate, obss[0])
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -464,21 +458,20 @@ def eval_vs_tft_selfagent1(stuff, unused):
     a1 = a
     a2 = a_opp
 
-    env_state, new_obs, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
-    obsv = new_obs
+    env_state, obss, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
 
     score1 = r1.mean()
     score2 = r2.mean()
 
-    stuff = (key, agent, env_state, obsv, astate, a, prev_agent_coin_collected_same_col, r1, r2)
+    stuff = (key, agent, env_state, obss, astate, a, prev_agent_coin_collected_same_col, r1, r2)
     aux = (score1, score2)
     return stuff, aux
 
 def eval_vs_tft_selfagent2(stuff, unused):
-    key, agent, env_state, obsv, astate, prev_a, prev_agent_coin_collected_same_col, r1, r2 = stuff
+    key, agent, env_state, obss, astate, prev_a, prev_agent_coin_collected_same_col, r1, r2 = stuff
 
     key, subkey = jax.random.split(key)
-    aux = act(subkey, agent, astate, obsv)
+    aux = act(subkey, agent, astate, obss[1])
     a, astate = aux["a"], aux["astate"]
 
     keys = jax.random.split(key, args.batch_size + 1)
@@ -503,13 +496,12 @@ def eval_vs_tft_selfagent2(stuff, unused):
     a1 = a_opp
     a2 = a
 
-    env_state, new_obs, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
-    obsv = new_obs
+    env_state, obss, (r1, r2), aux_info = vec_env_step(env_state, a1, a2, env_subkeys)
 
     score1 = r1.mean()
     score2 = r2.mean()
 
-    stuff = (key, agent, env_state, obsv, astate, a, prev_agent_coin_collected_same_col, r1, r2)
+    stuff = (key, agent, env_state, obss, astate, a, prev_agent_coin_collected_same_col, r1, r2)
     aux = (score1, score2)
     return stuff, aux
 
@@ -517,18 +509,18 @@ def eval_vs_fixed_strategy(key, agent, strat="alld", self_agent=1):
     keys = jax.random.split(key, args.batch_size + 1)
     key, env_subkeys = keys[0], keys[1:]
 
-    env_state, obsv = vec_env_reset(env_subkeys) # note this works only with the same obs, otherwise you would have to switch things up a bit here
+    env_state, obss = vec_env_reset(env_subkeys) # note this works only with the same obs, otherwise you would have to switch things up a bit here
 
     astate = agent.init_state(args.batch_size)
 
     if strat == "alld":
-        stuff = key, agent, env_state, obsv, astate
+        stuff = key, agent, env_state, obss, astate
         if self_agent == 1:
             stuff, aux = jax.lax.scan(eval_vs_alld_selfagent1, stuff, None, args.rollout_len)
         else:
             stuff, aux = jax.lax.scan(eval_vs_alld_selfagent2, stuff, None, args.rollout_len)
     elif strat == "allc":
-        stuff = key, agent, env_state, obsv, astate
+        stuff = key, agent, env_state, obss, astate
         if self_agent == 1:
             stuff, aux = jax.lax.scan(eval_vs_allc_selfagent1, stuff, None, args.rollout_len)
         else:
@@ -551,7 +543,7 @@ def eval_vs_fixed_strategy(key, agent, strat="alld", self_agent=1):
             r2 = jnp.zeros(args.batch_size)
         else:
             raise NotImplementedError
-        stuff = (key, agent, env_state, obsv, astate, prev_a,
+        stuff = (key, agent, env_state, obss, astate, prev_a,
                  prev_agent_coin_collected_same_col, r1, r2)
         if self_agent == 1:
             stuff, aux = jax.lax.scan(eval_vs_tft_selfagent1, stuff, None, args.rollout_len)
@@ -566,7 +558,7 @@ def eval_vs_fixed_strategy(key, agent, strat="alld", self_agent=1):
 def inspect_ipd(agents):
     assert args.env == 'ipd'
     unused_keys = jax.random.split(jax.random.PRNGKey(0), args.batch_size)
-    state, obsv = vec_env_reset(unused_keys)
+    state, obss = vec_env_reset(unused_keys)
     init_state = env.init_state
     for i in range(2):
         for j in range(2):
@@ -575,6 +567,7 @@ def inspect_ipd(agents):
                 for jj in range(2):
                     state2 = env.states[ii, jj]
                     state_history = [init_state, state1, state2]
+                    assert False # FIXME construct flipped state_history for player 2
                     print(state_history)
                     pol_probs1 = get_policies_for_states_onebatch(jax.random.PRNGKey(0), agents[0], state_history)
                     pol_probs2 = get_policies_for_states_onebatch(jax.random.PRNGKey(0), agents[1], state_history)
@@ -586,8 +579,7 @@ def inspect_ipd(agents):
 def eval_progress(subkey, agents):
     keys = jax.random.split(subkey, args.batch_size + 1)
     key, env_subkeys = keys[0], keys[1:]
-    env_state, obsv = vec_env_reset(env_subkeys)
-    obss = [obsv, obsv]
+    env_state, obss = vec_env_reset(env_subkeys)
     astates = [agent.init_state(args.batch_size) for agent in agents]
     key, subkey = jax.random.split(key)
 
