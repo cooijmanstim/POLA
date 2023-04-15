@@ -34,6 +34,7 @@ from coin_game_jax import CoinGame
 from ipd_jax import IPD
 
 deepmap = jax.tree_util.tree_map
+stop = jax.lax.stop_gradient
 
 @struct.dataclass
 class Agent:
@@ -146,46 +147,42 @@ def reverse_cumsum(x, axis):
 
 #@jit
 def magic_box(x):
-    return jnp.exp(x - jax.lax.stop_gradient(x))
-
-#@jit
-def update_gae_with_delta_backwards(gae, delta):
-    gae = gae * args.gamma * args.gae_lambda + delta
-    return gae, gae
+    return jnp.exp(x - stop(x))
 
 #@jit
 def get_gae_advantages(rewards, values, next_val_history):
-    deltas = rewards + args.gamma * jax.lax.stop_gradient(next_val_history) - jax.lax.stop_gradient(values)
+    deltas = rewards + args.gamma * next_val_history - values
     gae = jnp.zeros_like(deltas[0, :])
     deltas = jnp.flip(deltas, axis=0)
-    gae, flipped_advantages = jax.lax.scan(update_gae_with_delta_backwards, gae, deltas, deltas.shape[0])
+    def fn(gae, delta):
+        gae = gae * args.gamma * args.gae_lambda + delta
+        return gae, gae
+    gae, flipped_advantages = jax.lax.scan(fn, gae, deltas, deltas.shape[0])
     advantages = jnp.flip(flipped_advantages, axis=0)
     return advantages
 
 #@jit
 def dice_objective(self_logprobs, other_logprobs, rewards, values, end_state_v):
-    cum_discount = jnp.cumprod(args.gamma * jnp.ones(rewards.shape), axis=0) / args.gamma
+    cum_discount = args.gamma ** jnp.range(len(rewards))[:,None]
     discounted_rewards = rewards * cum_discount
     stochastic_nodes = self_logprobs + other_logprobs
 
     if use_baseline:
         assert values.shape[0] == args.rollout_len  # if so, use concatenate to construct this
-        next_val_history = jnp.zeros((args.rollout_len, args.batch_size))
-        next_val_history = next_val_history.at[:args.rollout_len-1].set(values[1:args.rollout_len])
-        next_val_history = next_val_history.at[-1].set(end_state_v)
+        next_values = jp.concatenate([values, end_state_v[None]])
 
         if args.zero_vals:
-            next_val_history = jnp.zeros_like(next_val_history)
+            next_values = jnp.zeros_like(next_values)
             values = jnp.zeros_like(values)
 
-        advantages = get_gae_advantages(rewards, values, next_val_history)
+        advantages = get_gae_advantages(rewards, values, next_values)
         discounted_advantages = advantages * cum_discount
         deps_up_to_t = jnp.cumsum(stochastic_nodes, axis=0)  # == `dependencies`?
         deps_less_than_t = deps_up_to_t - stochastic_nodes  # take out the dependency in the given time step
 
         # Look at Loaded DiCE and GAE papers to see where this formulation comes from
         dice_obj = ((magic_box(deps_up_to_t) - magic_box(deps_less_than_t))
-                    * discounted_advantages).sum(axis=0).mean()
+                    * stop(discounted_advantages)).sum(axis=0).mean()
     else:
         # dice objective:
         # REMEMBER that in this jax code the axis 0 is the rollout_len (number of time steps in the environment)
@@ -203,28 +200,28 @@ def dice_objective_plus_value_loss(self_logprobs, other_logprobs, rewards, value
     # Then we can actually take the respective grads like the way I have things set up now
     # And I should be able to update both policy and value functions
     reward_loss = dice_objective(self_logprobs, other_logprobs, rewards, values, end_state_v)
-    if use_baseline:
-        val_loss = value_loss(rewards, values, end_state_v)
-        return reward_loss + val_loss
-    else:
-        return reward_loss
+    val_loss = value_loss(rewards, values, end_state_v) if use_baseline else 0
+    return reward_loss, val_loss
 
 #@jit
 def value_loss(rewards, values, final_state_vals):
-    final_state_vals = jax.lax.stop_gradient(final_state_vals)
-    discounts = jnp.cumprod(args.gamma * jnp.ones(rewards.shape), axis=0) / args.gamma
-    gamma_t_r_ts = rewards * discounts
-    G_ts = reverse_cumsum(gamma_t_r_ts, axis=0)
+    discounts = args.gamma ** jnp.range(len(rewards))[:,None]
+    discounted_rewards = rewards * discounts
+    G_ts = reverse_cumsum(discounted_rewards, axis=0)
     R_ts = G_ts / discounts
     final_val_discounted_to_curr = (args.gamma * jnp.flip(discounts, axis=0)) * final_state_vals
     # You DO need a detach on these. Because it's the target - it should be detached. It's a target value.
     # Essentially a Monte Carlo style type return for R_t, except for the final state we also use the estimated final state value.
     # This becomes our target for the value function loss. So it's kind of a mix of Monte Carlo and bootstrap, but anyway you need the final value
     # because otherwise your value calculations will be inconsistent
-    # TODO(cooijmat) figure out if we do or do not need a detach here then
-    values_loss = (R_ts + final_val_discounted_to_curr - values) ** 2
+    # TODO(cooijmat) divide by cumsum(discounts) of some sort, or mul by 1-gamma
+    #values_loss = (R_ts + stop(final_val_discounted_to_curr) - values) ** 2
+    values_loss = huber(R_ts + stop(final_val_discounted_to_curr) - values)
     values_loss = values_loss.sum(axis=0).mean()
     return values_loss
+
+def huber(x):
+    return jnp.where(jnp.abs(x)<1, x**2, jnp.abs(x))
 
 #@jit
 def act(key, agent, astate, obs):
@@ -283,7 +280,7 @@ def env_step(key, env_state, obss, agents, astates):
     stuff = (key, env_state, new_obss, aux["astate"])
     return stuff, (dict(obss=new_obss, r=rewards, p=aux["p"], logp=aux["logp"], v=aux["v"], a=aux["a"]), aux_info)
 
-def do_env_rollout(key, agents, agent_for_state_history):
+def do_env_rollout(key, agents):
     keys = jax.random.split(key, args.batch_size + 1)
     key, env_subkeys = keys[0], keys[1:]
     env_state, obss = vec_env_reset(env_subkeys)
@@ -294,15 +291,10 @@ def do_env_rollout(key, agents, agent_for_state_history):
         (key, env_state, obss, astates) = carry
         return env_step(key, env_state, obss, agents, astates)
     carry = (key, env_state, obss, astates)
-    carry, (aux, aux_info) = jax.lax.scan(env_step_body, carry, None, args.rollout_len)
-
-    if agent_for_state_history == 1:
-        obsseq = [obss[0], *aux["obss"][0]]
-    elif agent_for_state_history == 2:
-        obsseq = [obss[1], *aux["obss"][1]]
-    else: raise ValueError(agent_for_state_history)
-
-    return carry, aux, obsseq
+    carry, (auxseq, aux_info) = jax.lax.scan(env_step_body, carry, None, args.rollout_len)
+    obsseq = [jp.concatenate([obss[i][None], auxseq["obss"][i]], axis=0)
+              for i in range(len(agents))]
+    return carry, auxseq, obsseq
 
 def kl_div_jax(curr, target):
     # TODO(cooijmat) wrong way around??
@@ -579,23 +571,23 @@ def train_exploiters_step(key, agents, exploiters):
     exploiters_ = exploiters
     def fn(paramss):
         exploiters = [e.replace_params(params) for e,params in zip(exploiters_,paramss)]
-        carry0,auxseq0,_ = do_env_rollout(key, [exploiters[0],agents[1]], agent_for_state_history=1)
-        carry1,auxseq1,_ = do_env_rollout(key, [agents[0],exploiters[1]], agent_for_state_history=1)
+        carry0,auxseq0,_ = do_env_rollout(key, [exploiters[0],agents[1]])
+        carry1,auxseq1,_ = do_env_rollout(key, [agents[0],exploiters[1]])
         (_,_,[obs0,_],[astate0,_]) = carry0
         (_,_,[_,obs1],[_,astate1]) = carry1
         auxend0 = act(jax.random.PRNGKey(1), exploiters[0], astate0, obs0)
         auxend1 = act(jax.random.PRNGKey(1), exploiters[1], astate1, obs1)
-        d0 = dice_objective_plus_value_loss(self_logprobs=auxseq0["logp"][0],
-                                            other_logprobs=auxseq0["logp"][1],
-                                            rewards=auxseq0["r"][0],
-                                            values=auxseq0["v"][0],
-                                            end_state_v=auxend0["v"])
-        d1 = dice_objective_plus_value_loss(self_logprobs=auxseq1["logp"][1],
-                                            other_logprobs=auxseq1["logp"][0],
-                                            rewards=auxseq1["r"][1],
-                                            values=auxseq1["v"][1],
-                                            end_state_v=auxend1["v"])
-        return d0+d1
+        r0,l0 = dice_objective_plus_value_loss(self_logprobs=auxseq0["logp"][0],
+                                               other_logprobs=auxseq0["logp"][1],
+                                               rewards=auxseq0["r"][0],
+                                               values=auxseq0["v"][0],
+                                               end_state_v=auxend0["v"])
+        r1,l1 = dice_objective_plus_value_loss(self_logprobs=auxseq1["logp"][1],
+                                               other_logprobs=auxseq1["logp"][0],
+                                               rewards=auxseq1["r"][1],
+                                               values=auxseq1["v"][1],
+                                               end_state_v=auxend1["v"])
+        return r0+l0+r1+l1
     grads = jax.grad(fn)([e.extract_params() for e in exploiters])
     exploiters = [exploiter.apply_gradients(grad) for exploiter,grad in zip(exploiters,grads)]
     return exploiters
@@ -676,14 +668,15 @@ def one_outer_step_update_selfagent1(key, agent1, ref_agents):
     def fn(params, key):
         agent1 = outer_agent1.replace_params(params)
         key, subkey = jax.random.split(key)
-        agent2_ahead, gradnorms = inner_update_agent2(subkey, agent1, ref_agent2)
-        objective = out_lookahead(key, [agent1, agent2_ahead], ref_agent1, self_agent=1)
-        return objective, gradnorms
+        agent2_ahead, iaux = inner_update_agent2(subkey, agent1, ref_agent2)
+        objective, aux = out_lookahead(key, [agent1, agent2_ahead], ref_agent1, self_agent=1)
+        return objective, [aux["loss"], iaux["gradnorms"]]
     key, subkey = jax.random.split(key)
-    (objective, inner_gradnorms), grad = jax.value_and_grad(fn, has_aux=True)(outer_agent1.extract_params(), subkey)
+    (_, [loss,inner_gradnorms]), grad = jax.value_and_grad(fn, has_aux=True)(outer_agent1.extract_params(), subkey)
     agent1 = agent1.apply_gradients(grad)
     outer_gradnorms = deepmap(lambda x: (x**2).mean(), grad)
-    return (key, agent1, ref_agents), dict(outer_agent1_gradnorms=outer_gradnorms,
+    return (key, agent1, ref_agents), dict(agent1_loss=loss,
+                                           outer_agent1_gradnorms=outer_gradnorms,
                                            inner_agent2_gradnorms=inner_gradnorms)
 
 @jit
@@ -693,14 +686,15 @@ def one_outer_step_update_selfagent2(key, agent2, ref_agents):
     def fn(params, key):
         agent2 = outer_agent2.replace_params(params)
         key, subkey = jax.random.split(key)
-        agent1_ahead, inner_gradnorms = inner_update_agent1(subkey, ref_agent1, agent2)
-        objective = out_lookahead(key, [agent1_ahead, agent2], ref_agent2, self_agent=2)
-        return objective, inner_gradnorms
+        agent1_ahead, iaux = inner_update_agent1(subkey, ref_agent1, agent2)
+        objective, aux = out_lookahead(key, [agent1_ahead, agent2], ref_agent2, self_agent=2)
+        return objective, [aux["loss"], iaux["gradnorms"]]
     key, subkey = jax.random.split(key)
-    (objective, inner_gradnorms), grad = jax.value_and_grad(fn, has_aux=True)(outer_agent2.extract_params(), subkey)
+    (objective, [loss,inner_gradnorms]), grad = jax.value_and_grad(fn, has_aux=True)(outer_agent2.extract_params(), subkey)
     agent2 = agent2.apply_gradients(grad)
     outer_gradnorms = deepmap(lambda x: (x**2).mean(), grad)
-    return (key, agent2, ref_agents), dict(inner_agent1_gradnorms=inner_gradnorms,
+    return (key, agent2, ref_agents), dict(agent2_loss=loss,
+                                           inner_agent1_gradnorms=inner_gradnorms,
                                            outer_agent2_gradnorms=outer_gradnorms)
 
 def inner_update_agent1(key, agent1, agent2):
@@ -718,21 +712,20 @@ def inner_update_agent1(key, agent1, agent2):
         def fn(params):
           agent1_ = agent1.replace_params(params)
           return in_lookahead(subkey, [agent1_, agent2], ref_agent1, other_agent=1)
-        grad = jax.grad(fn)(agent1.extract_params())
+        (_, aux), grad = jax.value_and_grad(fn,has_aux=True)(agent1.extract_params())
         agent1 = agent1.apply_gradients(grad)
         gradnorms = deepmap(lambda x: (x**2).mean(), grad)
-        return (key, agent1), gradnorms
+        return (key, agent1), dict(loss=aux["loss"], gradnorms=gradnorms)
 
     assert not args.old_kl_div
 
     key, subkey = jax.random.split(key)
     carry = (subkey, agent1)
-    carry, gradnorms = jax.lax.scan(body_fn, carry, None, args.inner_steps)
+    carry, aux = jax.lax.scan(body_fn, carry, None, args.inner_steps)
     agent1 = carry[1]
 
-    gradnorms = deepmap(lambda x: x.mean(axis=0), gradnorms)  # avg across time
-
-    return agent1, gradnorms
+    aux = deepmap(lambda x: x.mean(axis=0), aux)  # avg across time
+    return agent1, aux
 
 def inner_update_agent2(key, agent1, agent2):
     ref_agent2 = agent2
@@ -749,24 +742,23 @@ def inner_update_agent2(key, agent1, agent2):
         def fn(params):
             agent2_ = agent2.replace_params(params)
             return in_lookahead(subkey, [agent1, agent2_], ref_agent2, other_agent=2)
-        grad = jax.grad(fn)(agent2.extract_params())
+        (_,aux), grad = jax.value_and_grad(fn,has_aux=True)(agent2.extract_params())
         agent2 = agent2.apply_gradients(grad)
         gradnorms = deepmap(lambda x: (x**2).mean(), grad)
-        return (key, agent2), gradnorms
+        return (key, agent2), dict(loss=aux["loss"], gradnorms=gradnorms)
 
     assert not args.old_kl_div
 
     key, subkey = jax.random.split(key)
     carry = (subkey, agent2)
-    carry, gradnorms = jax.lax.scan(body_fn, carry, None, args.inner_steps)
+    carry, aux = jax.lax.scan(body_fn, carry, None, args.inner_steps)
     agent2 = carry[1]
 
-    gradnorms = deepmap(lambda x: x.mean(axis=0), gradnorms)  # avg across time
-
-    return agent2, gradnorms
+    aux = deepmap(lambda x: x.mean(axis=0), aux)  # avg across time
+    return agent2, aux
 
 def in_lookahead(key, agents, ref_agent, other_agent=2):
-    carry, auxseq, obsseq = do_env_rollout(key, agents, agent_for_state_history=other_agent)
+    carry, auxseq, obsseq = do_env_rollout(key, agents)
     (key, env_state, obss, astates) = carry
 
     # we are in the inner loop, so `other_agent` is us
@@ -776,23 +768,24 @@ def in_lookahead(key, agents, ref_agent, other_agent=2):
     # act just to get the final state values
     key, *subkeys = jax.random.split(key, 3)
     auxend = act(subkeys[us], agents[us], astates[us], obss[us])
-    objective = dice_objective_plus_value_loss(self_logprobs=auxseq["logp"][us],
-                                               other_logprobs=auxseq["logp"][them],
-                                               rewards=auxseq["r"][us],
-                                               values=auxseq["v"][us],
-                                               end_state_v=auxend["v"])
+    objective,loss = dice_objective_plus_value_loss(self_logprobs=auxseq["logp"][us],
+                                                    other_logprobs=auxseq["logp"][them],
+                                                    rewards=auxseq["r"][us],
+                                                    values=auxseq["v"][us],
+                                                    end_state_v=auxend["v"])
     # print(f"Inner Agent (Agent {other_agent}) episode return avg {auxseq['r'][us].sum(axis=0).mean()}")
 
     assert not args.old_kl_div
     key, sk1, sk2 = jax.random.split(key, 3)
-    probseq = get_policies_for_states(sk1, agents[us], obsseq)
-    probseq_ref = get_policies_for_states(sk2, ref_agent, obsseq)
+    probseq = get_policies_for_states(sk1, agents[us], obsseq[us])
+    probseq_ref = get_policies_for_states(sk2, ref_agent, obsseq[us])
     kl_div = kl_div_jax(probseq, probseq_ref)
 
-    return objective + args.inner_beta * kl_div  # we want to min kl div
+    return (objective + loss + args.inner_beta * kl_div,  # we want to min kl div
+            dict(loss=loss))
 
 def out_lookahead(key, agents, ref_agent, self_agent=1):
-    carry, auxseq, obsseq = do_env_rollout(key, agents, agent_for_state_history=self_agent)
+    carry, auxseq, obsseq = do_env_rollout(key, agents)
     (key, env_state, obss, astates) = carry
 
     # we are in the outer loop, so `self_agent` is us
@@ -802,20 +795,21 @@ def out_lookahead(key, agents, ref_agent, self_agent=1):
     # act just to get the final state values
     key, subkey = jax.random.split(key)
     auxend = act(subkey, agents[us], astates[us], obss[us])
-    objective = dice_objective_plus_value_loss(self_logprobs=auxseq["logp"][us],
-                                               other_logprobs=auxseq["logp"][them],
-                                               rewards=auxseq["r"][us],
-                                               values=auxseq["v"][us],
-                                               end_state_v=auxend["v"])
+    objective,loss = dice_objective_plus_value_loss(self_logprobs=auxseq["logp"][us],
+                                                    other_logprobs=auxseq["logp"][them],
+                                                    rewards=auxseq["r"][us],
+                                                    values=auxseq["v"][us],
+                                                    end_state_v=auxend["v"])
     # print(f"Agent {self_agent} episode return avg {auxseq['r'][us].sum(axis=0).mean()}")
 
     assert not args.old_kl_div
     key, sk1, sk2 = jax.random.split(key, 3)
-    probseq = get_policies_for_states(sk1, agents[us], obsseq)
-    probseq_ref = get_policies_for_states(sk2, ref_agent, obsseq)
+    probseq = get_policies_for_states(sk1, agents[us], obsseq[us])
+    probseq_ref = get_policies_for_states(sk2, ref_agent, obsseq[us])
     kl_div = kl_div_jax(probseq, probseq_ref)
 
-    return objective + args.outer_beta * kl_div
+    return (objective + loss + args.outer_beta * kl_div,
+            dict(loss=loss))
 
 stop = jax.lax.stop_gradient
 
@@ -845,12 +839,12 @@ def play(key, update, agents):
 
     print("start iterations with", args.inner_steps, "inner steps and", args.outer_steps, "outer steps:")
 
-    key, subkey = jax.random.split(key)
-    logframe = eval_progress(subkey,agents)
+    #key, subkey = jax.random.split(key)
+    #logframe = eval_progress(subkey,agents)
     #for k,v in logframe.items():
     #    record.setdefault(k,[]).append(v)
-    if args.wandb:
-        wandb.log(logframe)
+    #if args.wandb:
+    #    wandb.log(logframe)
 
     while True:  # update < args.n_update
         key, agents, optstats = update_agents(key, agents)
