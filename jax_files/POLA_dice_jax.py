@@ -32,7 +32,6 @@ from flax.training import checkpoints
 
 from coin_game_jax import CoinGame
 from ipd_jax import IPD
-import portedagent
 
 deepmap = jax.tree_util.tree_map
 
@@ -895,8 +894,10 @@ def play(key, update, agents):
             #os.rename("record.incoming.npz", "record.npz")
 
         if update % 100 == 0:
-            portedagent.dump_paramss([agent.extract_params()["pol"] for agent in agents],
-                                     f"agents_epoch{update}.pkl")
+            paramss = jax.tree_util.tree_map(np.array, [agent.extract_params()["pol"] for agent in agents])
+            with open(f"agents_epoch{update}.pkl.incoming", "wb") as file:
+                pickle.dump(paramss, file)
+            os.rename(f"agents_epoch{update}.pkl.incoming", f"agents_epoch{update}.pkl")
 
 from collections import abc
 def iterate_nested_dict(node):
