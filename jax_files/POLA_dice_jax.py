@@ -1,34 +1,17 @@
 # Some parts adapted from https://github.com/alexis-jacq/LOLA_DiCE/blob/master/ipd_DiCE.py
 # Some parts adapted from Chris Lu's MOFOS repo
 
-# import jnp
-import math
-# import jnp.nn as nn
-# from jnp.distributions import Categorical
-import numpy as np
-import argparse
-import os, pickle
-import datetime
-
-import jax
-import jax.numpy as jnp
-from jax import jit, vmap, pmap
-import functools
-import optax
+import math, argparse, os, pickle, datetime, functools
 from functools import partial
+import numpy as np
 
-import flax
-from flax import struct
-from flax import linen as nn
-import jax.numpy as jnp
-from typing import NamedTuple, Callable, Any
+import jax, jax.numpy as jnp
+from jax import jit, vmap, pmap
+import optax
+
+import flax, flax.struct as struct, flax.linen as nn
 from flax.training.train_state import TrainState
-
 from flax.training import checkpoints
-
-# tensorflow probability === tf/jax/cuda version hell
-#from tensorflow_probability.substrates import jax as tfp
-#tfd = tfp.distributions
 
 from coin_game_jax import CoinGame
 from ipd_jax import IPD
@@ -145,11 +128,9 @@ class Conv(nn.Module):
 def reverse_cumsum(x, axis):
     return x + jnp.sum(x, axis=axis, keepdims=True) - jnp.cumsum(x, axis=axis)
 
-#@jit
 def magic_box(x):
     return jnp.exp(x - stop(x))
 
-#@jit
 def get_gae_advantages(rewards, curr_values, next_values):
     deltas = rewards + args.gamma * next_values - curr_values
     gae = jnp.zeros_like(deltas[0, :])
@@ -161,7 +142,6 @@ def get_gae_advantages(rewards, curr_values, next_values):
     advantages = jnp.flip(flipped_advantages, axis=0)
     return advantages
 
-#@jit
 def dice_objective(self_logprobs, other_logprobs, rewards, values):
     cum_discount = args.gamma ** jnp.arange(len(rewards))[:,None]
     discounted_rewards = rewards * cum_discount
@@ -182,19 +162,15 @@ def dice_objective(self_logprobs, other_logprobs, rewards, values):
                     * stop(discounted_advantages)).sum(axis=0).mean()
     else:
         # dice objective:
-        # REMEMBER that in this jax code the axis 0 is the rollout_len (number of time steps in the environment)
-        # and axis 1 is the batch.
         dependencies = jnp.cumsum(stochastic_nodes, axis=0)
         dice_obj = (magic_box(dependencies) * discounted_rewards).sum(axis=0).mean()
     return -dice_obj  # want to minimize -objective
 
-#@jit
 def compute_objectives(self_logprobs, other_logprobs, rewards, values):
     reward_loss = dice_objective(self_logprobs, other_logprobs, rewards, values)
     val_loss = value_loss(rewards, values) if use_baseline else 0
     return reward_loss, val_loss
 
-#@jit
 def value_loss(rewards, values):
     discounts = args.gamma ** jnp.arange(len(rewards))[:,None]
     if args.use_a2c:  # a2c
@@ -215,7 +191,6 @@ def value_loss(rewards, values):
 def huber(x):
     return jnp.where(jnp.abs(x)<1, x**2, jnp.abs(x))
 
-#@jit
 def act(key, agent, astate, obs):
     new_astate = dict(astate)
     new_astate["pol"], logits = agent.pol.apply_fn(agent.pol.params, obs, astate["pol"])
@@ -234,7 +209,6 @@ def compute_values(agent, obsseq):
     _, values = jax.lax.scan(body_fn, valstate, obsseq)
     return values
 
-#@jit
 def compute_probs(key, agent, astate, obsseq):
     T,B,*_ = obsseq.shape
     astate = agent.init_state(B)
@@ -267,7 +241,6 @@ def do_env_rollout(key, agents):
     key, env_subkeys = keys[0], keys[1:]
     env_state, obss = vec_env_reset(env_subkeys)
     astates = [agent.init_state(args.batch_size) for agent in agents]
-
     @jax.named_call
     def env_step_body(carry, _):
         (key, env_state, obss, astates) = carry
@@ -279,9 +252,8 @@ def do_env_rollout(key, agents):
     return carry, auxseq, obsseq
 
 def kl_div_jax(curr, target):
-    # TODO(cooijmat) wrong way around??
+    # NOTE reverse kl, https://github.com/Silent-Zebra/POLA/issues/5
     return (curr * (jnp.log(curr) - jnp.log(target))).sum(axis=-1).mean()
-
 
 def eval_vs_alld_selfagent1(stuff, unused):
     key, agent, env_state, obss, astate = stuff
@@ -481,9 +453,7 @@ def eval_vs_tft_selfagent2(stuff, unused):
 def eval_vs_fixed_strategy(key, agent, strat="alld", self_agent=1):
     keys = jax.random.split(key, args.batch_size + 1)
     key, env_subkeys = keys[0], keys[1:]
-
-    env_state, obss = vec_env_reset(env_subkeys) # note this works only with the same obs, otherwise you would have to switch things up a bit here
-
+    env_state, obss = vec_env_reset(env_subkeys)
     astate = agent.init_state(args.batch_size)
 
     if strat == "alld":
@@ -546,7 +516,6 @@ def inspect_ipd(agents):
                     pol_probs2 = compute_probs(jax.random.PRNGKey(0), agents[1], state_history)
                     print(pol_probs1)
                     print(pol_probs2)
-    # Build state history artificially for all combs, and pass those into the pol_probs.
 
 @jit
 def train_exploiters_step(key, agents, exploiters):
@@ -693,8 +662,6 @@ def inner_update_agent1(key, agent1, agent2):
         gradnorms = deepmap(lambda x: (x**2).mean(), grad)
         return (key, agent1), dict(loss=aux["loss"], gradnorms=gradnorms)
 
-    assert not args.old_kl_div
-
     key, subkey = jax.random.split(key)
     carry = (subkey, agent1)
     carry, aux = jax.lax.scan(body_fn, carry, None, args.inner_steps)
@@ -723,8 +690,6 @@ def inner_update_agent2(key, agent1, agent2):
         gradnorms = deepmap(lambda x: (x**2).mean(), grad)
         return (key, agent2), dict(loss=aux["loss"], gradnorms=gradnorms)
 
-    assert not args.old_kl_div
-
     key, subkey = jax.random.split(key)
     carry = (subkey, agent2)
     carry, aux = jax.lax.scan(body_fn, carry, None, args.inner_steps)
@@ -747,7 +712,6 @@ def in_lookahead(key, agents, ref_agent, other_agent=2):
                                         rewards=auxseq["r"][us], values=values)
     # print(f"Inner Agent (Agent {other_agent}) episode return avg {auxseq['r'][us].sum(axis=0).mean()}")
 
-    assert not args.old_kl_div
     key, sk1, sk2 = jax.random.split(key, 3)
     probseq = compute_probs(sk1, agents[us], obsseq[us])
     probseq_ref = compute_probs(sk2, ref_agent, obsseq[us])
@@ -770,7 +734,6 @@ def out_lookahead(key, agents, ref_agent, self_agent=1):
                                         rewards=auxseq["r"][us], values=values)
     # print(f"Agent {self_agent} episode return avg {auxseq['r'][us].sum(axis=0).mean()}")
 
-    assert not args.old_kl_div
     key, sk1, sk2 = jax.random.split(key, 3)
     probseq = compute_probs(sk1, agents[us], obsseq[us])
     probseq_ref = compute_probs(sk2, ref_agent, obsseq[us])
@@ -780,17 +743,14 @@ def out_lookahead(key, agents, ref_agent, self_agent=1):
             dict(loss=loss))
 
 def update_agents(key, agents):
-    assert not args.old_kl_div  # too gnarly
     agent1, agent2 = list(agents)
 
-    # --- AGENT 1 UPDATE ---
     key, subkey = jax.random.split(key)
     carry = (subkey, agent1, agents)
     for _ in range(args.outer_steps):
         carry, aux1 = one_outer_step_update_selfagent1(*carry)
     agent1 = carry[1]
 
-    # --- AGENT 2 UPDATE ---
     key, subkey = jax.random.split(key)
     carry = (subkey, agent2, agents)
     for _ in range(args.outer_steps):
@@ -799,7 +759,6 @@ def update_agents(key, agents):
 
     return key, [agent1, agent2], {**aux1, **aux2}
 
-# redefine play, simplified so we can actually see what's happening (cooijmat)
 def play(key, update, agents):
     #record = dict()
 
@@ -905,7 +864,6 @@ if __name__ == "__main__":
                         help="lambda for GAE (1 = monte carlo style, 0 = TD style)")
     parser.add_argument("--val_update_after_loop", action="store_true", help="Update values only after outer POLA loop finishes, not during the POLA loop")
     parser.add_argument("--std", type=float, default=0.1, help="standard deviation for initialization of policy/value parameters")
-    parser.add_argument("--old_kl_div", action="store_true", help="Use the old version of KL div relative to just one batch of states at the beginning")
     parser.add_argument("--inspect_ipd", action="store_true", help="Detailed (2 steps + start state) policy information in the IPD with full history")
     parser.add_argument("--layers_before_gru", type=int, default=2, choices=[0, 1, 2], help="Number of linear layers (with ReLU activation) before GRU, supported up to 2 for now")
     parser.add_argument("--contrib_factor", type=float, default=1.33, help="contribution factor to vary difficulty of IPD")
@@ -913,7 +871,6 @@ if __name__ == "__main__":
     parser.add_argument("--use_a2c", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     args = parser.parse_args()
-    assert not args.old_kl_div
 
     if args.wandb:
         import wandb
@@ -922,7 +879,6 @@ if __name__ == "__main__":
 
     np.random.seed(args.seed)
     if args.env == 'coin':
-        #assert args.grid_size == 3  # rest not implemented yet
         input_size = args.grid_size ** 2 * 4
         action_size = 4
         env = CoinGame(grid_size=args.grid_size)
