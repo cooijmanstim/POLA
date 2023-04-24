@@ -54,12 +54,16 @@ class Agent:
         pol_params = pol.init_params(key_pol, jnp.ones([args.batch_size, input_size]))
         val_params = val.init_params(key_val, jnp.ones([args.batch_size, input_size]))
 
+        def sgdclip(learning_rate):
+            return optax.chain(optax.clip(1), optax.sgd(learning_rate))
+        def adamclip(learning_rate):
+            return optax.chain(optax.clip(1), optax.adam(learning_rate))
         if args.optim.lower() == 'adam':
-            pol_optimizer = optax.adam(learning_rate=args.lr_out)
-            val_optimizer = optax.adam(learning_rate=args.lr_v)
+            pol_optimizer = adamclip(learning_rate=args.lr_out)
+            val_optimizer = adamclip(learning_rate=args.lr_v)
         elif args.optim.lower() == 'sgd':
-            pol_optimizer = optax.sgd(learning_rate=args.lr_out)
-            val_optimizer = optax.sgd(learning_rate=args.lr_v)
+            pol_optimizer = sgdclip(learning_rate=args.lr_out)
+            val_optimizer = sgdclip(learning_rate=args.lr_v)
         else:
             raise Exception("Unknown or Not Implemented Optimizer")
 
@@ -174,7 +178,8 @@ def compute_objectives(self_logprobs, other_logprobs, rewards, values):
 def value_loss(rewards, values):
     discounts = args.gamma ** jnp.arange(len(rewards))[:,None]
     if args.use_a2c:  # a2c
-        deltas = rewards + args.gamma*values[1:] - curr_values[:-1]
+        #deltas = rewards + args.gamma*values[1:] - values[:-1]
+        deltas = get_gae_advantages(rewards, values[:-1], values[1:])
         return huber(deltas).sum(axis=0).mean()
     else:
         # the original value loss is a mix of various amounts of bootstrapping -- the loss
@@ -209,18 +214,15 @@ def compute_values(agent, obsseq):
     _, values = jax.lax.scan(body_fn, valstate, obsseq)
     return values
 
-def compute_probs(key, agent, astate, obsseq):
+def compute_probs(agent, obsseq):
     T,B,*_ = obsseq.shape
-    astate = agent.init_state(B)
-    key, subkey = jax.random.split(key)
+    polstate = agent.init_state(B)["pol"]
     @jax.named_call
-    def body_fn(carry, obs):
-        key, astate = carry
-        key, subkey = jax.random.split(key)
-        astate, aux = act(subkey, agent, astate, obs)
-        return (key, astate), aux["p"]
+    def body_fn(polstate, obs):
+        polstate, logits = agent.pol.apply_fn(agent.pol.params, obs, polstate)
+        return polstate, nn.softmax(logits)
     obsseq = jnp.stack(obsseq[:args.rollout_len], axis=0) # TODO(cooijmat) stack this in caller
-    carry, probs = jax.lax.scan(body_fn, (subkey, astate), obsseq, args.rollout_len)
+    _, probs = jax.lax.scan(body_fn, polstate, obsseq, args.rollout_len)
     return probs
 
 def dicttranspose(dikts):
@@ -512,8 +514,8 @@ def inspect_ipd(agents):
                     state_history = [init_state, state1, state2]
                     assert False # FIXME construct flipped state_history for player 2
                     print(state_history)
-                    pol_probs1 = compute_probs(jax.random.PRNGKey(0), agents[0], state_history)
-                    pol_probs2 = compute_probs(jax.random.PRNGKey(0), agents[1], state_history)
+                    pol_probs1 = compute_probs(agents[0], state_history)
+                    pol_probs2 = compute_probs(agents[1], state_history)
                     print(pol_probs1)
                     print(pol_probs2)
 
