@@ -225,6 +225,17 @@ def compute_probs(agent, obsseq):
     _, probs = jax.lax.scan(body_fn, polstate, obsseq, args.rollout_len)
     return probs
 
+def compute_logits(agent, obsseq):
+    T,B,*_ = obsseq.shape
+    polstate = agent.init_state(B)["pol"]
+    @jax.named_call
+    def body_fn(polstate, obs):
+        polstate, logits = agent.pol.apply_fn(agent.pol.params, obs, polstate)
+        return polstate, nn.log_softmax(logits)
+    obsseq = jnp.stack(obsseq[:args.rollout_len], axis=0) # TODO(cooijmat) stack this in caller
+    _, logits = jax.lax.scan(body_fn, polstate, obsseq, args.rollout_len)
+    return logits
+
 def dicttranspose(dikts):
     assert all(set(dikt) == set(dikts[0]) for dikt in dikts[1:])
     return {key: [dikt[key] for dikt in dikts] for key in dikts[0]}
@@ -253,9 +264,9 @@ def do_env_rollout(key, agents):
               for i in range(len(agents))]
     return carry, auxseq, obsseq
 
-def kl_div_jax(curr, target):
+def kl_div_logits(curr, target):
     # NOTE reverse kl, https://github.com/Silent-Zebra/POLA/issues/5
-    return (curr * (jnp.log(curr) - jnp.log(target))).sum(axis=-1).mean()
+    return (jnp.exp(curr) * (curr - target)).sum(axis=-1).mean()
 
 def eval_vs_alld_selfagent1(stuff, unused):
     key, agent, env_state, obss, astate = stuff
@@ -514,8 +525,8 @@ def inspect_ipd(agents):
                     state_history = [init_state, state1, state2]
                     assert False # FIXME construct flipped state_history for player 2
                     print(state_history)
-                    pol_probs1 = compute_probs(agents[0], state_history)
-                    pol_probs2 = compute_probs(agents[1], state_history)
+                    pol_probs1 = jnp.exp(compute_logits(agents[0], state_history))
+                    pol_probs2 = jnp.exp(compute_logits(agents[1], state_history))
                     print(pol_probs1)
                     print(pol_probs2)
 
@@ -714,15 +725,14 @@ def in_lookahead(key, agents, ref_agent, other_agent=2):
                                         rewards=auxseq["r"][us], values=values)
     # print(f"Inner Agent (Agent {other_agent}) episode return avg {auxseq['r'][us].sum(axis=0).mean()}")
 
-    key, sk1, sk2 = jax.random.split(key, 3)
-    probseq = compute_probs(sk1, agents[us], obsseq[us])
-    probseq_ref = compute_probs(sk2, ref_agent, obsseq[us])
-    kl_div = kl_div_jax(probseq, probseq_ref)
+    logitseq = compute_logits(agents[us], obsseq[us])
+    logitseq_ref = compute_logits(ref_agent, obsseq[us])
+    kl_div = kl_div_logits(logitseq, logitseq_ref)
 
     return (objective + loss + args.inner_beta * kl_div,  # we want to min kl div
             dict(loss=loss))
 
-def out_lookahead(key, agents, ref_agent, self_agent=1):
+def out_lookahead(key, agents, ref_agent, self_agent):
     carry, auxseq, obsseq = do_env_rollout(key, agents)
     (key, env_state, obss, astates) = carry
 
@@ -736,10 +746,9 @@ def out_lookahead(key, agents, ref_agent, self_agent=1):
                                         rewards=auxseq["r"][us], values=values)
     # print(f"Agent {self_agent} episode return avg {auxseq['r'][us].sum(axis=0).mean()}")
 
-    key, sk1, sk2 = jax.random.split(key, 3)
-    probseq = compute_probs(sk1, agents[us], obsseq[us])
-    probseq_ref = compute_probs(sk2, ref_agent, obsseq[us])
-    kl_div = kl_div_jax(probseq, probseq_ref)
+    logitseq = compute_logits(agents[us], obsseq[us])
+    logitseq_ref = compute_logits(ref_agent, obsseq[us])
+    kl_div = kl_div_logits(logitseq, logitseq_ref)
 
     return (objective + loss + args.outer_beta * kl_div,
             dict(loss=loss))
