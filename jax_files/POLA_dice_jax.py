@@ -14,7 +14,9 @@ from flax.training.train_state import TrainState
 from flax.training import checkpoints
 
 from coin_game_jax import CoinGame
-from ipd_jax import IPD
+from ipd_jax import IPD, MiladIPD
+
+jax.config.update("jax_debug_nans", True)  # make sure runs stop upon nan
 
 deepmap = jax.tree_util.tree_map
 stop = jax.lax.stop_gradient
@@ -48,6 +50,9 @@ class Agent:
         elif args.architecture == "conv":
           pol = Conv(num_outputs=action_size, num_hidden_units=args.hidden_size, window=3)
           val = Conv(num_outputs=1, num_hidden_units=args.hidden_size, window=3)
+        elif args.architecture == "miladipd":
+          pol = MiladIPDAgent(num_outputs=action_size, num_hidden_units=16)
+          val = MiladIPDAgent(num_outputs=1, num_hidden_units=16)
         else: raise KeyError(args.architecture)
 
         key_pol, key_val = jax.random.split(key)
@@ -125,6 +130,23 @@ class Conv(nn.Module):
         return [jnp.zeros([batch_size, self.num_hidden_units])
                 for _ in range(self.window)]
 
+    @nn.nowrap
+    def init_params(self, key, x):
+        return self.init(key, x, self.init_state(x.shape[0]))
+
+class MiladIPDAgent(nn.Module):
+    num_hidden_units: int
+    num_outputs: int
+
+    @nn.compact
+    def __call__(self, x, _):
+        h = nn.tanh(nn.Dense(features=self.num_hidden_units)(x))
+        y = nn.Dense(features=self.num_outputs)(h)
+        return (), y
+
+    @nn.nowrap
+    def init_state(self, batch_size):
+        return ()
     @nn.nowrap
     def init_params(self, key, x):
         return self.init(key, x, self.init_state(x.shape[0]))
@@ -283,6 +305,8 @@ def eval_vs_alld_selfagent1(stuff, unused):
 
     if args.env == "ipd":
         a_opp = jnp.zeros_like(a) # Always defect
+    elif args.env == "miladipd":
+        a_opp = jnp.ones_like(a) # Always defect
     elif args.env == "coin":
         a_opp = env.get_moves_shortest_path_to_coin(env_state, opp_is_red_agent)
 
@@ -312,6 +336,8 @@ def eval_vs_alld_selfagent2(stuff, unused):
 
     if args.env == "ipd":
         a_opp = jnp.zeros_like(a) # Always defect
+    elif args.env == "miladipd":
+        a_opp = jnp.ones_like(a) # Always defect
     elif args.env == "coin":
         a_opp = env.get_moves_shortest_path_to_coin(env_state, opp_is_red_agent)
 
@@ -342,6 +368,8 @@ def eval_vs_allc_selfagent1(stuff, unused):
 
     if args.env == "ipd":
         a_opp = jnp.ones_like(a) # Always cooperate
+    elif args.env == "miladipd":
+        a_opp = jnp.zeros_like(a) # Always cooperate
     elif args.env == "coin":
         a_opp = env.get_coop_action(env_state, opp_is_red_agent)
 
@@ -372,6 +400,8 @@ def eval_vs_allc_selfagent2(stuff, unused):
 
     if args.env == "ipd":
         a_opp = jnp.ones_like(a) # Always cooperate
+    elif args.env == "miladipd":
+        a_opp = jnp.zeros_like(a) # Always cooperate
     elif args.env == "coin":
         a_opp = env.get_coop_action(env_state, opp_is_red_agent)
 
@@ -397,7 +427,7 @@ def eval_vs_tft_selfagent1(stuff, unused):
     keys = jax.random.split(key, args.batch_size + 1)
     key, env_subkeys = keys[0], keys[1:]
 
-    if args.env == "ipd":
+    if args.env.endswith("ipd"):
         # Copy last move of agent; assumes prev_a = all coop
         a_opp = prev_a
         prev_agent_coin_collected_same_col = None
@@ -435,7 +465,7 @@ def eval_vs_tft_selfagent2(stuff, unused):
     keys = jax.random.split(key, args.batch_size + 1)
     key, env_subkeys = keys[0], keys[1:]
 
-    if args.env == "ipd":
+    if args.env.endswith("ipd"):
         # Copy last move of agent; assumes prev_a = all coop
         a_opp = prev_a
         prev_agent_coin_collected_same_col = None
@@ -488,6 +518,12 @@ def eval_vs_fixed_strategy(key, agent, strat="alld", self_agent=1):
             r1 = jnp.zeros(args.batch_size)  # these don't matter for IPD,
             r2 = jnp.zeros(args.batch_size)
             prev_agent_coin_collected_same_col = None
+        elif args.env == "miladipd":
+            prev_a = jnp.zeros(
+                args.batch_size, dtype=int)  # assume agent (self) cooperated for the init time step when the opponent is using TFT
+            r1 = jnp.zeros(args.batch_size)  # these don't matter for IPD,
+            r2 = jnp.zeros(args.batch_size)
+            prev_agent_coin_collected_same_col = None
         elif args.env == "coin":
             if self_agent == 1:
                 prev_a = env.get_coop_action(env_state, red_agent_perspective=False)  # doesn't matter for coin
@@ -512,9 +548,7 @@ def eval_vs_fixed_strategy(key, agent, strat="alld", self_agent=1):
     return (score1, score2), None
 
 def inspect_ipd(agents):
-    assert args.env == 'ipd'
-    unused_keys = jax.random.split(jax.random.PRNGKey(0), args.batch_size)
-    state, obss = vec_env_reset(unused_keys)
+    assert args.env.endswith('ipd')
     init_state = env.init_state
     for i in range(2):
         for j in range(2):
@@ -523,10 +557,10 @@ def inspect_ipd(agents):
                 for jj in range(2):
                     state2 = env.states[ii, jj]
                     state_history = [init_state, state1, state2]
-                    assert False # FIXME construct flipped state_history for player 2
+                    state_history2 = [env.flip_obs(x) for x in state_history]
                     print(state_history)
                     pol_probs1 = jnp.exp(compute_logits(agents[0], state_history))
-                    pol_probs2 = jnp.exp(compute_logits(agents[1], state_history))
+                    pol_probs2 = jnp.exp(compute_logits(agents[1], state_history2))
                     print(pol_probs1)
                     print(pol_probs2)
 
@@ -622,38 +656,32 @@ def eval_progress(key, agents):
 @jit
 def one_outer_step_update_selfagent1(key, agent1, ref_agents):
     ref_agent1, ref_agent2 = ref_agents
-    outer_agent1 = agent1
     def fn(params, key):
-        agent1 = outer_agent1.replace_params(params)
+        agent1_ = agent1.replace_params(params)
         key, subkey = jax.random.split(key)
-        agent2_ahead, iaux = inner_update_agent2(subkey, agent1, ref_agent2)
-        objective, aux = out_lookahead(key, [agent1, agent2_ahead], ref_agent1, self_agent=1)
-        return objective, [aux["loss"], iaux["gradnorms"]]
+        agent2_ahead, iaux = inner_update_agent2(subkey, agent1_, ref_agent2)
+        objective, aux = out_lookahead(key, [agent1_, agent2_ahead], ref_agent1, self_agent=1)
+        return objective, [aux,iaux]
     key, subkey = jax.random.split(key)
-    (_, [loss,inner_gradnorms]), grad = jax.value_and_grad(fn, has_aux=True)(outer_agent1.extract_params(), subkey)
+    (_, [aux,iaux]), grad = jax.value_and_grad(fn, has_aux=True)(agent1.extract_params(), subkey)
     agent1 = agent1.apply_gradients(grad)
-    outer_gradnorms = deepmap(lambda x: (x**2).mean(), grad)
-    return (key, agent1, ref_agents), dict(agent1_loss=loss,
-                                           outer_agent1_gradnorms=outer_gradnorms,
-                                           inner_agent2_gradnorms=inner_gradnorms)
+    aux["gradnorms"] = deepmap(lambda x: (x**2).mean(), grad)
+    return (key, agent1, ref_agents), dict(outer=aux, inner=iaux)
 
 @jit
 def one_outer_step_update_selfagent2(key, agent2, ref_agents):
     ref_agent1, ref_agent2 = ref_agents
-    outer_agent2 = agent2
     def fn(params, key):
-        agent2 = outer_agent2.replace_params(params)
+        agent2_ = agent2.replace_params(params)
         key, subkey = jax.random.split(key)
-        agent1_ahead, iaux = inner_update_agent1(subkey, ref_agent1, agent2)
-        objective, aux = out_lookahead(key, [agent1_ahead, agent2], ref_agent2, self_agent=2)
-        return objective, [aux["loss"], iaux["gradnorms"]]
+        agent1_ahead, iaux = inner_update_agent1(subkey, ref_agent1, agent2_)
+        objective, aux = out_lookahead(key, [agent1_ahead, agent2_], ref_agent2, self_agent=2)
+        return objective, [aux,iaux]
     key, subkey = jax.random.split(key)
-    (objective, [loss,inner_gradnorms]), grad = jax.value_and_grad(fn, has_aux=True)(outer_agent2.extract_params(), subkey)
+    (_, [aux,iaux]), grad = jax.value_and_grad(fn, has_aux=True)(agent2.extract_params(), subkey)
     agent2 = agent2.apply_gradients(grad)
-    outer_gradnorms = deepmap(lambda x: (x**2).mean(), grad)
-    return (key, agent2, ref_agents), dict(agent2_loss=loss,
-                                           inner_agent1_gradnorms=inner_gradnorms,
-                                           outer_agent2_gradnorms=outer_gradnorms)
+    aux["gradnorms"] = deepmap(lambda x: (x**2).mean(), grad)
+    return (key, agent2, ref_agents), dict(outer=aux, inner=iaux)
 
 def inner_update_agent1(key, agent1, agent2):
     ref_agent1 = agent1
@@ -668,19 +696,19 @@ def inner_update_agent1(key, agent1, agent2):
         key, agent1 = carry
         key, subkey = jax.random.split(key)
         def fn(params):
-          agent1_ = agent1.replace_params(params)
-          return in_lookahead(subkey, [agent1_, agent2], ref_agent1, other_agent=1)
+            agent1_ = agent1.replace_params(params)
+            return in_lookahead(subkey, [agent1_, agent2], ref_agent1, other_agent=1)
         (_, aux), grad = jax.value_and_grad(fn,has_aux=True)(agent1.extract_params())
         agent1 = agent1.apply_gradients(grad)
         gradnorms = deepmap(lambda x: (x**2).mean(), grad)
-        return (key, agent1), dict(loss=aux["loss"], gradnorms=gradnorms)
+        return (key, agent1), dict(gradnorms=gradnorms, **aux)
 
     key, subkey = jax.random.split(key)
     carry = (subkey, agent1)
     carry, aux = jax.lax.scan(body_fn, carry, None, args.inner_steps)
     agent1 = carry[1]
 
-    aux = deepmap(lambda x: x.mean(axis=0), aux)  # avg across time
+    #aux = deepmap(lambda x: x.mean(axis=0), aux)  # avg across time
     return agent1, aux
 
 def inner_update_agent2(key, agent1, agent2):
@@ -701,17 +729,17 @@ def inner_update_agent2(key, agent1, agent2):
         (_,aux), grad = jax.value_and_grad(fn,has_aux=True)(agent2.extract_params())
         agent2 = agent2.apply_gradients(grad)
         gradnorms = deepmap(lambda x: (x**2).mean(), grad)
-        return (key, agent2), dict(loss=aux["loss"], gradnorms=gradnorms)
+        return (key, agent2), dict(gradnorms=gradnorms, **aux)
 
     key, subkey = jax.random.split(key)
     carry = (subkey, agent2)
     carry, aux = jax.lax.scan(body_fn, carry, None, args.inner_steps)
     agent2 = carry[1]
 
-    aux = deepmap(lambda x: x.mean(axis=0), aux)  # avg across time
+    #aux = deepmap(lambda x: x.mean(axis=0), aux)  # avg across time
     return agent2, aux
 
-def in_lookahead(key, agents, ref_agent, other_agent=2):
+def in_lookahead(key, agents, ref_agent, other_agent):
     carry, auxseq, obsseq = do_env_rollout(key, agents)
     (key, env_state, obss, astates) = carry
 
@@ -730,7 +758,7 @@ def in_lookahead(key, agents, ref_agent, other_agent=2):
     kl_div = kl_div_logits(logitseq, logitseq_ref)
 
     return (objective + loss + args.inner_beta * kl_div,  # we want to min kl div
-            dict(loss=loss))
+            dict(loss=loss, returns=objective, kl=kl_div))
 
 def out_lookahead(key, agents, ref_agent, self_agent):
     carry, auxseq, obsseq = do_env_rollout(key, agents)
@@ -751,24 +779,64 @@ def out_lookahead(key, agents, ref_agent, self_agent):
     kl_div = kl_div_logits(logitseq, logitseq_ref)
 
     return (objective + loss + args.outer_beta * kl_div,
-            dict(loss=loss))
+            dict(loss=loss, returns=objective, kl=kl_div))
 
 def update_agents(key, agents):
     agent1, agent2 = list(agents)
 
     key, subkey = jax.random.split(key)
     carry = (subkey, agent1, agents)
+    aux1s = []
     for _ in range(args.outer_steps):
         carry, aux1 = one_outer_step_update_selfagent1(*carry)
+        aux1s.append(aux1)
     agent1 = carry[1]
 
     key, subkey = jax.random.split(key)
     carry = (subkey, agent2, agents)
+    aux2s = []
     for _ in range(args.outer_steps):
         carry, aux2 = one_outer_step_update_selfagent2(*carry)
+        aux2s.append(aux2)
     agent2 = carry[1]
 
-    return key, [agent1, agent2], {**aux1, **aux2}
+    # now merge aux1s and aux2s.
+    # aux?s has outer list level over outer time
+    # aux?s[i]["inner"] has leading inner time axis
+    logframes = []
+    for i, (aux1,aux2) in enumerate(zip(aux1s,aux2s)):
+        # deep unstack inner
+        [J] = aux1["inner"]["loss"].shape
+        for j in range(J):
+            logframe = dict()
+            for k,v in aux1["inner"].items():
+              if k == "gradnorms":
+                for path,leaf in iterate_nested_dict(v):
+                  logframe["_".join(map(str, ["iagent2","grad",*path]))] = leaf[j]
+              else:
+                logframe[f"iagent2_{k}"] = v[j]
+            for k,v in aux2["inner"].items():
+              if k == "gradnorms":
+                for path,leaf in iterate_nested_dict(v):
+                  logframe["_".join(map(str, ["iagent1","grad",*path]))] = leaf[j]
+              else:
+                logframe[f"iagent1_{k}"] = v[j]
+            logframes.append(logframe)
+        # add outer auxes to last inner logframe
+        for k,v in aux1["outer"].items():
+          if k == "gradnorms":
+            for path,leaf in iterate_nested_dict(v):
+              logframe["_".join(map(str, ["oagent1","grad",*path]))] = leaf
+          else:
+            logframe[f"oagent1_{k}"] = v
+        for k,v in aux2["outer"].items():
+          if k == "gradnorms":
+            for path,leaf in iterate_nested_dict(v):
+              logframe["_".join(map(str, ["oagent2","grad",*path]))] = leaf
+          else:
+            logframe[f"oagent2_{k}"] = v
+
+    return key, [agent1, agent2], logframes
 
 def play(key, update, agents):
     #record = dict()
@@ -783,26 +851,26 @@ def play(key, update, agents):
     #    wandb.log(logframe)
 
     while True:  # update < args.n_update
-        key, agents, optstats = update_agents(key, agents)
-        optstats = {key: {"_".join(map(str, path)): np.array(value)
-                          for path, value in iterate_nested_dict(thing)}
-                    for key, thing in optstats.items()}
-        update += 1
+        key, agents, optframes = update_agents(key, agents)
+        if args.wandb:
+          for optframe in optframes:
+            update += 1
+            wandb.log(deepmap(np.array, dict(opt=optframe)), step=update)
 
         # evaluate progress:
         key, subkey = jax.random.split(key)
         logframe = eval_progress(subkey,agents)
         #for k,v in logframe.items():
         #    record[k].append(v)
-        logframe["opt"] = optstats
         if args.wandb:
-            wandb.log(logframe,step=update)
+          wandb.log(logframe, step=update)
 
         # print
-        if update % args.print_every == 0:
+        epoch = update//(args.outer_steps*args.inner_steps)
+        if epoch % args.print_every == 0:
             def printframe(update,score1,score2,rr,rb,br,bb,score1rec,score2rec,**kwargs):
                 print("*" * 10)
-                print("Epoch: {}".format(update), flush=True)
+                print(f"Epoch: {epoch} Updates: {update}", flush=True)
                 print(f"scores {score1} {score2}")
                 if args.env == 'coin':
                     print(f"same {rr+bb} diff {rb+br}")
@@ -810,12 +878,12 @@ def play(key, update, agents):
                 print("Scores vs fixed strats ALLD, ALLC, TFT:")
                 print(score1rec)
                 print(score2rec)
-                if args.env == 'ipd':
+                if args.env.endswith('ipd'):
                     if args.inspect_ipd:
                         inspect_ipd(agents)
             printframe(update,**logframe)
 
-        if update % args.checkpoint_every == 0:
+        if epoch % args.checkpoint_every == 0:
             checkpoints.save_checkpoint(ckpt_dir=".",
                                         target=(update,agents),
                                         step=update,
@@ -823,11 +891,11 @@ def play(key, update, agents):
             #np.savez_compressed("record.incoming.npz", **record)
             #os.rename("record.incoming.npz", "record.npz")
 
-        if update % 100 == 0:
+        if epoch % 100 == 0:
             paramss = jax.tree_util.tree_map(np.array, [agent.extract_params()["pol"] for agent in agents])
-            with open(f"agents_epoch{update}.pkl.incoming", "wb") as file:
+            with open(f"agents_epoch{epoch}.pkl.incoming", "wb") as file:
                 pickle.dump(paramss, file)
-            os.rename(f"agents_epoch{update}.pkl.incoming", f"agents_epoch{update}.pkl")
+            os.rename(f"agents_epoch{epoch}.pkl.incoming", f"agents_epoch{epoch}.pkl")
 
 from collections import abc
 def iterate_nested_dict(node):
@@ -865,7 +933,7 @@ if __name__ == "__main__":
     parser.add_argument("--optim", type=str, default="adam", help="Used only for the outer agent (in the out_lookahead)")
     parser.add_argument("--no_baseline", action="store_true", help="Use NO Baseline (critic) for variance reduction. Default is baseline using Loaded DiCE with GAE")
     parser.add_argument("--env", type=str, default="coin",
-                        choices=["ipd", "coin"])
+                        choices=["ipd", "miladipd", "coin"])
     parser.add_argument("--hist_one", action="store_true", help="Use one step history (no gru or rnn, just one step history)")
     parser.add_argument("--print_info_each_outer_step", action="store_true", help="For debugging/curiosity sake")
     parser.add_argument("--init_state_coop", action="store_true", help="For IPD only: have the first state be CC instead of a separate start state")
@@ -878,15 +946,18 @@ if __name__ == "__main__":
     parser.add_argument("--inspect_ipd", action="store_true", help="Detailed (2 steps + start state) policy information in the IPD with full history")
     parser.add_argument("--layers_before_gru", type=int, default=2, choices=[0, 1, 2], help="Number of linear layers (with ReLU activation) before GRU, supported up to 2 for now")
     parser.add_argument("--contrib_factor", type=float, default=1.33, help="contribution factor to vary difficulty of IPD")
-    parser.add_argument("--architecture", type=str, default="rnn", choices="rnn conv".split())
+    parser.add_argument("--architecture", type=str, default="rnn", choices="rnn conv miladipd".split())
     parser.add_argument("--use_a2c", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     args = parser.parse_args()
 
-    if args.wandb:
-        import wandb
-        wandb.init(project="pola", resume=True)
-        wandb.config.update(args)
+    use_baseline = True
+    if args.no_baseline:
+        use_baseline = False
+
+    assert args.inner_steps >= 1
+    # Use 0 lr if you want no inner steps... TODO allow for this functionality (naive learning)?
+    assert args.outer_steps >= 1
 
     np.random.seed(args.seed)
     if args.env == 'coin':
@@ -897,6 +968,10 @@ if __name__ == "__main__":
         input_size = 6 # 3 * n_agents
         action_size = 2
         env = IPD(init_state_coop=args.init_state_coop, contrib_factor=args.contrib_factor)
+    elif args.env == 'miladipd':
+        input_size = 4 # 2 * n_agents; all zero indicates initial state
+        action_size = 2
+        env = MiladIPD(contrib_factor=args.contrib_factor)
     else:
         raise NotImplementedError("unknown env")
     vec_env_reset = jax.vmap(env.reset)
@@ -906,18 +981,16 @@ if __name__ == "__main__":
     key, key1, key2 = jax.random.split(key, 3)
     agents = [Agent.make(key1, action_size, input_size),
               Agent.make(key2, action_size, input_size)]
+
     update,agents = checkpoints.restore_checkpoint(ckpt_dir=".",
                                                    target=(0,agents),
                                                    prefix="ckpt_epoch")
     if update > 0:
       print("resuming after", update, "updates")
 
-    use_baseline = True
-    if args.no_baseline:
-        use_baseline = False
-
-    assert args.inner_steps >= 1
-    # Use 0 lr if you want no inner steps... TODO allow for this functionality (naive learning)?
-    assert args.outer_steps >= 1
+    if args.wandb:
+        import wandb
+        wandb.init(project="pola", resume=True, tags=[args.env])
+        wandb.config.update(args)
 
     play(key, update, agents)
