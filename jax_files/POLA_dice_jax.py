@@ -4,6 +4,7 @@
 
 # TODO: FULL CODE REVIEW AND COMMENT EVERYTHING THAT IS HAPPENING.
 
+import os, pickle
 import numpy as np
 import argparse
 import datetime
@@ -19,10 +20,8 @@ from flax.training.train_state import TrainState
 
 from flax.training import checkpoints
 
-from tensorflow_probability.substrates import jax as tfp
-
-tfd = tfp.distributions
-
+#from tensorflow_probability.substrates import jax as tfp
+#tfd = tfp.distributions
 
 from coin_game_jax import CoinGame
 from ipd_jax import IPD
@@ -178,12 +177,12 @@ def act(stuff, unused ):
         h_v, values = None, None
         ret_vals = None
 
-    dist = tfd.Categorical(logits=logits)
     key, subkey = jax.random.split(key)
-    actions = dist.sample(seed=subkey)
-
-    log_probs_actions = dist.log_prob(actions)
-
+    #dist = tfd.Categorical(logits=logits)
+    #actions = dist.sample(seed=subkey)
+    actions = jax.random.categorical(subkey, logits)
+    #log_probs_actions = dist.log_prob(actions)
+    log_probs_actions = jax.vmap(lambda z,a:z[a])(jax.nn.log_softmax(logits), actions)
 
     stuff = (key, env_batch_states, th_p_trainstate, th_p_trainstate_params, th_v_trainstate, th_v_trainstate_params, h_p, h_v)
     aux = (actions, log_probs_actions, ret_vals, h_p, h_v, categorical_act_probs, logits)
@@ -1929,6 +1928,14 @@ def play(key, init_trainstate_th1, init_trainstate_val1, init_trainstate_th2, in
             if args.env == 'ipd':
                 if args.inspect_ipd:
                     inspect_ipd(trainstate_th1, trainstate_val1, trainstate_th2, trainstate_val2)
+
+        if update == 0 or (update + 1) % 50 == 0:
+            paramss = jax.tree_util.tree_map(np.array, [trainstate_th1.params, trainstate_th2.params])
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+            filename = f"agents_t{timestamp}_seed{args.seed}_update{update+1}"
+            with open(f"{filename}.pkl.incoming", "wb") as file:
+                pickle.dump(paramss, file)
+            os.rename(f"{filename}.pkl.incoming", f"{filename}.pkl")
 
         if (update + 1) % args.checkpoint_every == 0:
             now = datetime.datetime.now()
